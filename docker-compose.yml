@@ -1,0 +1,55 @@
+version: '3.8'
+services:
+db:
+image: postgres:15
+environment:
+POSTGRES_DB: appdb
+POSTGRES_USER: appuser
+POSTGRES_PASSWORD: changeme
+volumes:
+- db-data:/var/lib/postgresql/data
+ports:
+- "5432:5432"
+
+
+redis:
+image: redis:7
+ports:
+- "6379:6379"
+
+
+web:
+build: ./backend
+command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+volumes:
+- ./backend:/app
+ports:
+- "8000:8000"
+depends_on:
+- db
+- redis
+
+
+worker:
+build: ./backend
+command: celery -A app.tasks.celery worker --loglevel=info
+volumes:
+- ./backend:/app
+depends_on:
+- db
+- redis
+
+
+streamlit:
+build: ./streamlit
+command: streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+ports:
+- "8501:8501"
+volumes:
+- ./:/workspace
+depends_on:
+- web
+
+
+volumes:
+db-data:
