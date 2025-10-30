@@ -19,22 +19,22 @@ services:
     ports:
       - "6379:6379"
 
-  web:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    image: my-backend:latest
-    restart: always
-    environment:
-      DATABASE_URL: postgresql://appuser:changeme@db:5432/appdb
-      CELERY_BROKER_URL: redis://redis:6379/0
-    depends_on:
-      - db
-      - redis
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend:/app
+web:
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  image: my-backend:latest
+  restart: always
+  environment:
+    DATABASE_URL: postgresql://appuser:changeme@db:5432/appdb
+    CELERY_BROKER_URL: redis://redis:6379/0
+  depends_on:
+    - db
+    - redis
+  ports:
+    - "8000:8000"
+  volumes:
+    - ./backend:/app
 
   worker:
     build:
