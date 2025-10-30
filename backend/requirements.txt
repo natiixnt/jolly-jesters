@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+psycopg2-binary
+alembic
+pandas
+celery[redis]
+redis
+python-dotenv
+requests
+beautifulsoup4
+openpyxl
+pydantic
+uvicorn
