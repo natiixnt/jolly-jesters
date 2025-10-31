@@ -1,3 +1,4 @@
+# Plik: docker-compose.yml
 version: "3.9"
 
 services:
@@ -29,6 +30,7 @@ services:
       sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     volumes:
       - ./backend:/app
+      - workspace_data:/workspace  # <-- POPRAWKA: Dodaj współdzielony wolumen
     environment:
       - WORKSPACE=/workspace
       - CELERY_BROKER_URL=redis://redis:6379/0
@@ -48,6 +50,7 @@ services:
       sh -c "alembic upgrade head && celery -A app.tasks.celery worker --loglevel=info"
     volumes:
       - ./backend:/app
+      - workspace_data:/workspace  # <-- POPRAWKA: Dodaj ten sam współdzielony wolumen
     environment:
       - WORKSPACE=/workspace
       - CELERY_BROKER_URL=redis://redis:6379/0
@@ -70,3 +73,4 @@ services:
 
 volumes:
   pgdata:
+  workspace_data: {} # <-- POPRAWKA: Zdefiniuj nowy wolumen
