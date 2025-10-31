@@ -107,9 +107,13 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
                 elif val == "w trakcie...": return "background-color: #e0e0e0"
                 else: return ""
 
+            # --- POPRAWKA: Zmiana .applymap na .map ---
             results_placeholder.dataframe(
-                df.style.applymap(color_recommendation, subset=["recommendation"])
+                df.style.map(color_recommendation, subset=["recommendation"])
             )
+            # --- KONIEC POPRAWKI ---
+
+            
 
             # Stan 5: Sukces (Zakończono)
             if done == total and total > 0:
