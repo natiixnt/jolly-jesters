@@ -5,10 +5,8 @@ import pandas as pd
 from celery import Celery
 from datetime import datetime, timedelta
 
-# --- POPRAWKA: Brakujące importy ---
-from sqlalchemy.orm import Session # Do type hinting (tego brakowało)
-from .database import SessionLocal # Do tworzenia sesji (już tam było, ale upewniamy się)
-# --- KONIEC POPRAWKI ---
+from sqlalchemy.orm import Session 
+from .database import SessionLocal 
 
 from . import models
 from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
@@ -30,7 +28,7 @@ def parse_import_file(self, import_job_id: int, filepath: str):
     """
     Krok 1: Parsuje wgrany plik, tworzy ProductInput i kolejkuje zadania fetch_allegro_data
     """
-    db = SessionLocal() # Użyj SessionLocal() do stworzenia sesji
+    db = SessionLocal() 
     job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
     if not job:
         db.close()
@@ -42,14 +40,22 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         except Exception as e:
             raise ValueError(f"Nie można otworzyć pliku: {e}")
             
-        df.columns = [c.lower() for c in df.columns]
+        # Normalizuj nazwy kolumn (małe litery)
+        df.columns = [str(c).lower() for c in df.columns]
         
+        # --- POPRAWKA: Bardziej elastyczne wyszukiwanie kolumn ---
         ean_col = next((c for c in df.columns if 'ean' in c), None)
-        name_col = next((c for c in df.columns if c in ['name', 'nazwa']), None)
-        price_col = next((c for c in df.columns if c in ['price', 'cena zakupu']), None)
+        name_col = next((c for c in df.columns if 'name' in c or 'nazwa' in c), None)
+        price_col = next((c for c in df.columns if 'price' in c or 'cena' in c), None)
+        # --- KONIEC POPRAWKI ---
         
-        if not all([ean_col, name_col, price_col]):
-             raise ValueError("Nie znaleziono wymaganych kolumn (EAN, nazwa/Name, cena zakupu/Price)")
+        missing_cols = []
+        if not ean_col: missing_cols.append("EAN")
+        if not name_col: missing_cols.append("Nazwa/Name")
+        if not price_col: missing_cols.append("Cena/Price")
+        
+        if missing_cols:
+             raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
         
         df["ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df["name_norm"] = df[name_col].astype(str).str.strip()
@@ -60,8 +66,8 @@ def parse_import_file(self, import_job_id: int, filepath: str):
 
         products_to_enqueue = []
         for _, row in df.iterrows():
-            if not row["ean_norm"] or pd.isna(row["price_norm"]):
-                continue 
+            if not row["ean_norm"] or pd.isna(row["price_norm"]) or row["price_norm"] <= 0:
+                continue # Pomiń wiersze bez EAN lub z niepoprawną ceną
 
             p = models.ProductInput(
                 import_job_id=import_job_id,
