@@ -5,7 +5,6 @@ import pandas as pd
 import time
 from io import BytesIO
 
-# Używamy nazwy serwisu z docker-compose
 API_BASE = "http://pilot_backend:8000/api" 
 
 st.set_page_config(page_title="Import Allegro", layout="wide")
@@ -30,8 +29,8 @@ if uploaded_file and st.button("Rozpocznij import"):
                 job_id = response.json()["job_id"]
                 st.success(f"Plik wgrany, job_id={job_id}")
                 st.session_state["job_id"] = job_id
-                st.session_state["stop_polling"] = False # Flaga do zatrzymania pętli
-                st.rerun() # Odśwież, aby uruchomić pętlę monitorowania
+                st.session_state["stop_polling"] = False 
+                st.rerun() 
             else:
                 st.error(f"Błąd przy wysyłaniu pliku: {response.status_code} - {response.text}")
         except requests.exceptions.ConnectionError:
@@ -65,41 +64,38 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
             status = job_data.get("status")
             notes = job_data.get("notes")
 
-            # --- POCZĄTEK POPRAWKI LOGIKI ---
+            # --- POPRAWKA LOGIKI PĘTLI ---
 
-            # 1. Sprawdź, czy zadanie parsowania się nie powiodło
-            if status == "error" and notes:
+            # 1. Sprawdź, czy zadanie parsowania się nie powiodło (NAJPIERW)
+            # Celery może ustawić status na 'FAILURE', a nasza logika na 'error'
+            if status in ["error", "FAILURE"] and notes:
                 st.error(f"Błąd przetwarzania pliku! Powód: {notes}")
-                st.warning("Proszę, popraw plik (np. nazwy kolumn) i wgraj go ponownie.")
+                st.warning("Proszę, popraw plik (np. nazwy kolumn lub zawartość) i wgraj go ponownie.")
                 progress_bar.empty()
                 st.session_state["stop_polling"] = True # Zakończ pętlę
                 break
 
-            # 2. Sprawdź, czy zadanie jeszcze nie ruszyło
-            if status in ["pending", "queued"]:
-                status_text.info(f"Oczekiwanie na uruchomienie zadania... (Status: {status})")
+            # 2. Pobierz produkty (zawsze próbuj pobrać)
+            products_resp = requests.get(f"{API_BASE}/imports/{job_id}/products")
+            products = products_resp.json() if products_resp.status_code == 200 else []
+
+            # 3. Sprawdź, czy są produkty
+            if not products:
+                if status in ["pending", "queued"]:
+                    status_text.info(f"Oczekiwanie na uruchomienie zadania... (Status: {status})")
+                elif status == "processing":
+                    status_text.info("Zadanie uruchomione, oczekiwanie na pierwsze wyniki...")
+                else:
+                    status_text.info("Brak produktów do przetworzenia.")
+                
                 time.sleep(3)
                 continue # Sprawdź status ponownie
 
-            # 3. Jeśli status to "processing" lub "done", pobierz produkty
-            products_resp = requests.get(f"{API_BASE}/imports/{job_id}/products")
-            if products_resp.status_code != 200:
-                st.warning("Nie można pobrać listy produktów...")
-                time.sleep(3)
-                continue
-            
-            products = products_resp.json()
+            # --- KONIEC POPRAWKI LOGIKI PĘTLI ---
 
-            # --- KONIEC POPRAWKI LOGIKI ---
-
-            if not products:
-                status_text.info("Zadanie uruchomione, oczekiwanie na pierwsze wyniki...")
-                time.sleep(3)
-                continue
-
+            # Jeśli doszliśmy tutaj, MAMY produkty
             df = pd.DataFrame(products)
             
-            # Obliczanie postępu
             total = len(df)
             done = len(df[df["status"].isin(["done", "not_found", "error"])])
             progress = int((done / total) * 100) if total > 0 else 0
@@ -107,7 +103,6 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
             progress_bar.progress(progress)
             status_text.info(f"Postęp: {progress}% (Przetworzono {done} z {total})")
 
-            # Definicja kolorowania
             def color_recommendation(val):
                 if val == "opłacalny": return "background-color: #b2f0b2"
                 elif val == "nieopłacalny": return "background-color: #f0b2b2"
@@ -124,9 +119,8 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
             if done == total and total > 0:
                 st.success("Przetwarzanie zakończone!")
                 progress_bar.progress(100)
-                st.session_state["stop_polling"] = True # Zakończ pętlę
+                st.session_state["stop_polling"] = True 
                 
-                # Przygotuj pobieranie
                 csv_buffer = BytesIO()
                 df.to_csv(csv_buffer, index=False, encoding='utf-8')
                 st.download_button(
@@ -137,7 +131,7 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
                 )
                 break 
 
-            time.sleep(3) # Czekaj 3 sekundy przed kolejnym odpytaniem
+            time.sleep(3) 
 
         except requests.exceptions.ConnectionError:
             st.error("Utracono połączenie z backendem. Przerywam monitorowanie.")

@@ -7,11 +7,18 @@ from datetime import datetime, timedelta
 from .database import SessionLocal
 from . import models
 from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
-# Importujemy ustawienia cache z config
 from .config import CACHE_TTL_DAYS 
 
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery = Celery("app.tasks", broker=CELERY_BROKER)
+
+# --- NOWA FUNKCJA POMOCNICZA ---
+def update_job_error(db: Session, job: models.ImportJob, message: str):
+    """Pomocnik do aktualizowania statusu błędu w bazie"""
+    job.status = "error"
+    job.notes = message
+    db.commit()
+# --- KONIEC FUNKCJI POMOCNICZEJ ---
 
 
 @celery.task(bind=True, acks_late=True, max_retries=3)
@@ -20,20 +27,18 @@ def parse_import_file(self, import_job_id: int, filepath: str):
     Krok 1: Parsuje wgrany plik, tworzy ProductInput i kolejkuje zadania fetch_allegro_data
     """
     db = SessionLocal()
-    try:
-        job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
-        if not job:
-            return
+    job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
+    if not job:
+        return
 
+    try:
         try:
             df = pd.read_excel(filepath) if filepath.lower().endswith(".xlsx") else pd.read_csv(filepath, dtype=str)
         except Exception as e:
-            job.status = "error"
-            job.notes = f"Nie można otworzyć pliku: {e}"
-            db.commit()
-            return
+            # Rzucamy błąd, jeśli pliku nie da się otworzyć
+            raise ValueError(f"Nie można otworzyć pliku: {e}")
             
-        # --- MODYFIKACJA: Elastyczne mapowanie kolumn ---
+        # Elastyczne mapowanie kolumn
         df.columns = [c.lower() for c in df.columns]
         
         ean_col = next((c for c in df.columns if 'ean' in c), None)
@@ -41,10 +46,8 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         price_col = next((c for c in df.columns if c in ['price', 'cena zakupu']), None)
         
         if not all([ean_col, name_col, price_col]):
-             job.status = "error"
-             job.notes = "Nie znaleziono wymaganych kolumn (EAN, nazwa/Name, cena zakupu/Price)"
-             db.commit()
-             return
+             # Rzucamy błąd, jeśli brakuje kolumn
+             raise ValueError("Nie znaleziono wymaganych kolumn (EAN, nazwa/Name, cena zakupu/Price)")
         
         df["ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df["name_norm"] = df[name_col].astype(str).str.strip()
@@ -52,13 +55,11 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             df[price_col].astype(str).str.replace(',', '.'), 
             errors='coerce'
         )
-        # --- KONIEC MODYFIKACJI ---
 
         products_to_enqueue = []
         for _, row in df.iterrows():
-            # Pomiń wiersze bez EAN lub ceny
             if not row["ean_norm"] or pd.isna(row["price_norm"]):
-                continue 
+                continue # Pomiń wiersze bez EAN lub ceny
 
             p = models.ProductInput(
                 import_job_id=import_job_id,
@@ -66,35 +67,36 @@ def parse_import_file(self, import_job_id: int, filepath: str):
                 name=row["name_norm"],
                 purchase_price=row["price_norm"],
                 currency=job.meta.get("currency", "PLN"),
-                status="pending", # Poprawny status początkowy
+                status="pending",
             )
             db.add(p)
             products_to_enqueue.append(p)
             
         if not products_to_enqueue:
-            job.status = "error"
-            job.notes = "Nie znaleziono poprawnych wierszy w pliku."
-            db.commit()
-            return
+            # Rzucamy błąd, jeśli plik jest pusty
+            raise ValueError("Nie znaleziono poprawnych wierszy w pliku (sprawdź EAN i Ceny).")
 
-        db.commit()
+        # Jeśli doszliśmy tutaj, walidacja jest OK
+        job.status = "processing" # Ustawiamy status na "processing"
+        db.commit() # Zapisujemy produkty I status "processing"
 
-        # Zakolejkuj zadania scrapingu (robimy to po commicie, aby mieć ID produktów)
+        # Kolejkujemy zadania scrapingu (robimy to po commicie, aby mieć ID produktów)
         for p in products_to_enqueue:
             db.refresh(p) # Pobierz ID z bazy
-            # Kolejkujemy zadanie pobrania danych dla każdego produktu
             fetch_allegro_data.delay(p.id, p.ean)
 
-        job.status = "processing"
-        db.commit()
-
-    except Exception as e:
-        # Obsługa niespodziewanego błędu
+    except (ValueError, Exception) as e:
+        # --- POPRAWKA: Łapiemy błąd, aktualizujemy bazę I RZUCAMY DALEJ ---
         db.rollback()
-        job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
-        job.status = "error"
-        job.notes = f"Błąd krytyczny parsera: {e}"
-        db.commit()
+        # Używamy nowej sesji, aby zapisać błąd, nawet jeśli poprzednia transakcja padła
+        db_error_session = SessionLocal()
+        job_to_update = db_error_session.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
+        if job_to_update:
+            update_job_error(db_error_session, job_to_update, str(e))
+        db_error_session.close()
+        
+        # Rzucamy błąd dalej, aby Celery oznaczył zadanie jako "FAILURE"
+        raise e
     finally:
         db.close()
 
@@ -102,34 +104,29 @@ def parse_import_file(self, import_job_id: int, filepath: str):
 @celery.task(bind=True, acks_late=True, max_retries=3)
 def fetch_allegro_data(self, product_input_id: int, ean: str):
     """
-    Krok 2: Pobiera dane z Allegro dla pojedynczego ProductInput ID, z logiką cache.
+    Krok 2: Pobiera dane z Allegro (z logiką cache)
     """
     db = SessionLocal()
     try:
         p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
         if not p:
-            return # Produkt został usunięty?
+            return 
 
-        # --- POCZĄTEK MODYFIKACJI (LOGIKA CACHE) ---
-        
         # 1. Sprawdź cache
         cache = db.query(models.AllegroCache).filter(models.AllegroCache.ean == ean).first()
         ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
 
         if cache and cache.fetched_at > ttl_limit:
-            # Mamy świeże dane w cache, użyj ich
             if cache.not_found:
                 p.status = "not_found"
                 p.notes = f"Cached not_found @ {cache.fetched_at.date()}"
             else:
                 p.status = "done"
                 p.notes = f"Cached data @ {cache.fetched_at.date()}"
-            
             db.commit()
-            return # Zakończ, nie scrapuj
+            return 
         
-        # 2. Brak w cache lub stare dane -> uruchom scraper
-        # result = (lowest_price, sold_count, source, fetched_at, not_found)
+        # 2. Brak w cache -> uruchom scraper
         result = scraper_fetch(ean) 
         
         new_status = "done"
@@ -158,10 +155,10 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
         p.notes = notes
         
         db.commit()
-        # --- KONIEC MODYFIKACJI ---
 
     except Exception as e:
         db.rollback()
+        # Logika błędu dla fetch_allegro_data (ustawia status "error" na produkcie)
         p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
         if p:
             p.status = "error"
