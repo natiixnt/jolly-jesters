@@ -14,6 +14,7 @@ class ImportJob(Base):
     multiplier = Column(Float, default=1.5)
     created_at = Column(DateTime, default=datetime.utcnow)
     status = Column(String, default="pending")
+    notes = Column(String, nullable=True)
     products = relationship("ProductInput", back_populates="import_job")
     exports = relationship("Export", back_populates="import_job")
 

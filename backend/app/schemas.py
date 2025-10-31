@@ -111,3 +111,4 @@ class ProductAnalysis(BaseModel):
     profit_margin: Optional[float]
     recommendation: Optional[str]  # opłacalny / nieopłacalny / brak danych
     notes: Optional[str]
+    status: Optional[str] = None 
