@@ -36,6 +36,7 @@ class JobStatus(BaseModel):
     id: int
     status: str
     meta: Optional[dict] = None
+    notes: Optional[str] = None # <-- DODAJ TĘ LINIĘ
 
 # -----------------------
 # Product input
