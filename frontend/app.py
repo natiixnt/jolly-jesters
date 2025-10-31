@@ -50,50 +50,46 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
     status_text = st.empty()
     results_placeholder = st.empty()
 
-    # Pętla do odświeżania
     while True:
         try:
-            # 1. Sprawdź status całego joba
+            # 1. Zawsze sprawdzaj status joba
             status_resp = requests.get(f"{API_BASE}/imports/{job_id}/status")
             if status_resp.status_code != 200:
-                st.error("Nie można pobrać statusu joba. Przerywam monitorowanie.")
-                st.session_state["stop_polling"] = True
-                break
+                 st.error("Nie można pobrać statusu joba. Przerywam.")
+                 st.session_state["stop_polling"] = True
+                 break
             
             job_data = status_resp.json()
             status = job_data.get("status")
             notes = job_data.get("notes")
 
-            # --- POPRAWKA LOGIKI PĘTLI ---
+            # --- OSTATECZNA POPRAWKA LOGIKI PĘTLI ---
 
-            # 1. Sprawdź, czy zadanie parsowania się nie powiodło (NAJPIERW)
-            # Celery może ustawić status na 'FAILURE', a nasza logika na 'error'
-            if status in ["error", "FAILURE"] and notes:
-                st.error(f"Błąd przetwarzania pliku! Powód: {notes}")
+            # Stan 1: Błąd (NAJWYŻSZY PRIORYTET)
+            if status in ["error", "FAILURE"]:
+                st.error(f"Błąd krytyczny zadania! Powód: {notes}")
                 st.warning("Proszę, popraw plik (np. nazwy kolumn lub zawartość) i wgraj go ponownie.")
                 progress_bar.empty()
-                st.session_state["stop_polling"] = True # Zakończ pętlę
-                break
+                st.session_state["stop_polling"] = True
+                break # Zakończ pętlę
 
-            # 2. Pobierz produkty (zawsze próbuj pobrać)
+            # Stan 2: Sprawdź produkty
             products_resp = requests.get(f"{API_BASE}/imports/{job_id}/products")
             products = products_resp.json() if products_resp.status_code == 200 else []
 
-            # 3. Sprawdź, czy są produkty
+            # Stan 3: W trakcie (jeśli nie ma jeszcze produktów)
             if not products:
                 if status in ["pending", "queued"]:
                     status_text.info(f"Oczekiwanie na uruchomienie zadania... (Status: {status})")
                 elif status == "processing":
                     status_text.info("Zadanie uruchomione, oczekiwanie na pierwsze wyniki...")
-                else:
-                    status_text.info("Brak produktów do przetworzenia.")
                 
                 time.sleep(3)
                 continue # Sprawdź status ponownie
 
-            # --- KONIEC POPRAWKI LOGIKI PĘTLI ---
+            # --- KONIEC POPRAWKI ---
 
-            # Jeśli doszliśmy tutaj, MAMY produkty
+            # Stan 4: Przetwarzanie (są produkty)
             df = pd.DataFrame(products)
             
             total = len(df)
@@ -115,10 +111,9 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
                 df.style.applymap(color_recommendation, subset=["recommendation"])
             )
 
-            # Warunek wyjścia z pętli (Sukces)
+            # Stan 5: Sukces (Zakończono)
             if done == total and total > 0:
                 st.success("Przetwarzanie zakończone!")
-                progress_bar.progress(100)
                 st.session_state["stop_polling"] = True 
                 
                 csv_buffer = BytesIO()
