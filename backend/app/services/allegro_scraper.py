@@ -46,9 +46,10 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: str = None):
     for attempt in range(3):
         try:
             headers = {"User-Agent": random.choice(USER_AGENTS)}
-            # Wyszukujemy po EAN w trybie "product" (karty produktu), nie "offer"
             url = f"https://allegro.pl/listing?string={ean}&scope=product"
-            resp = requests.get(url, headers=headers, timeout=10)
+            
+            # --- ZMIEŃ 10 NA 15 PONIŻEJ ---
+            resp = requests.get(url, headers=headers, timeout=15) # <-- POPRAWKA
             
             if resp.status_code != 200:
                 time.sleep(1 + attempt)
