@@ -4,7 +4,12 @@ import os
 import pandas as pd
 from celery import Celery
 from datetime import datetime, timedelta
-from .database import SessionLocal
+
+# --- POPRAWKA: Brakujące importy ---
+from sqlalchemy.orm import Session # Do type hinting (tego brakowało)
+from .database import SessionLocal # Do tworzenia sesji (już tam było, ale upewniamy się)
+# --- KONIEC POPRAWKI ---
+
 from . import models
 from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
 from .config import CACHE_TTL_DAYS 
@@ -12,13 +17,12 @@ from .config import CACHE_TTL_DAYS
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery = Celery("app.tasks", broker=CELERY_BROKER)
 
-# --- NOWA FUNKCJA POMOCNICZA ---
+
 def update_job_error(db: Session, job: models.ImportJob, message: str):
     """Pomocnik do aktualizowania statusu błędu w bazie"""
     job.status = "error"
     job.notes = message
     db.commit()
-# --- KONIEC FUNKCJI POMOCNICZEJ ---
 
 
 @celery.task(bind=True, acks_late=True, max_retries=3)
@@ -26,19 +30,18 @@ def parse_import_file(self, import_job_id: int, filepath: str):
     """
     Krok 1: Parsuje wgrany plik, tworzy ProductInput i kolejkuje zadania fetch_allegro_data
     """
-    db = SessionLocal()
+    db = SessionLocal() # Użyj SessionLocal() do stworzenia sesji
     job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
     if not job:
+        db.close()
         return
 
     try:
         try:
             df = pd.read_excel(filepath) if filepath.lower().endswith(".xlsx") else pd.read_csv(filepath, dtype=str)
         except Exception as e:
-            # Rzucamy błąd, jeśli pliku nie da się otworzyć
             raise ValueError(f"Nie można otworzyć pliku: {e}")
             
-        # Elastyczne mapowanie kolumn
         df.columns = [c.lower() for c in df.columns]
         
         ean_col = next((c for c in df.columns if 'ean' in c), None)
@@ -46,7 +49,6 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         price_col = next((c for c in df.columns if c in ['price', 'cena zakupu']), None)
         
         if not all([ean_col, name_col, price_col]):
-             # Rzucamy błąd, jeśli brakuje kolumn
              raise ValueError("Nie znaleziono wymaganych kolumn (EAN, nazwa/Name, cena zakupu/Price)")
         
         df["ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
@@ -59,7 +61,7 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         products_to_enqueue = []
         for _, row in df.iterrows():
             if not row["ean_norm"] or pd.isna(row["price_norm"]):
-                continue # Pomiń wiersze bez EAN lub ceny
+                continue 
 
             p = models.ProductInput(
                 import_job_id=import_job_id,
@@ -73,30 +75,24 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             products_to_enqueue.append(p)
             
         if not products_to_enqueue:
-            # Rzucamy błąd, jeśli plik jest pusty
             raise ValueError("Nie znaleziono poprawnych wierszy w pliku (sprawdź EAN i Ceny).")
 
-        # Jeśli doszliśmy tutaj, walidacja jest OK
-        job.status = "processing" # Ustawiamy status na "processing"
-        db.commit() # Zapisujemy produkty I status "processing"
+        job.status = "processing" 
+        db.commit() 
 
-        # Kolejkujemy zadania scrapingu (robimy to po commicie, aby mieć ID produktów)
         for p in products_to_enqueue:
-            db.refresh(p) # Pobierz ID z bazy
+            db.refresh(p) 
             fetch_allegro_data.delay(p.id, p.ean)
 
     except (ValueError, Exception) as e:
-        # --- POPRAWKA: Łapiemy błąd, aktualizujemy bazę I RZUCAMY DALEJ ---
         db.rollback()
-        # Używamy nowej sesji, aby zapisać błąd, nawet jeśli poprzednia transakcja padła
         db_error_session = SessionLocal()
         job_to_update = db_error_session.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
         if job_to_update:
             update_job_error(db_error_session, job_to_update, str(e))
         db_error_session.close()
         
-        # Rzucamy błąd dalej, aby Celery oznaczył zadanie jako "FAILURE"
-        raise e
+        raise e 
     finally:
         db.close()
 
@@ -110,6 +106,7 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
     try:
         p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
         if not p:
+            db.close()
             return 
 
         # 1. Sprawdź cache
@@ -158,7 +155,6 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
 
     except Exception as e:
         db.rollback()
-        # Logika błędu dla fetch_allegro_data (ustawia status "error" na produkcie)
         p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
         if p:
             p.status = "error"
