@@ -34,6 +34,8 @@ class ProductInput(Base):
     status = Column(String, default="pending")  # pending, queued, processing, done, not_found, error
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    notes = Column(String, nullable=True) # <-- DODAJ TĘ LINIĘ
+
     import_job = relationship("ImportJob", back_populates="products")
 
 # -----------------------
