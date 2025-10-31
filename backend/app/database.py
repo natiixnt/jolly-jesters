@@ -1,19 +1,20 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-import os
+from .config import DATABASE_URL
 
+# engine
+engine = create_engine(DATABASE_URL, echo=False)
 
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://appuser:changeme@db:5432/appdb')
-
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# baza modeli
 Base = declarative_base()
 
-
+# dependency do FastAPI
 def get_db():
-db = SessionLocal()
-try:
-yield db
-finally:
-db.close()
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

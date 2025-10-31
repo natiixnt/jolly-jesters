@@ -12,3 +12,5 @@ beautifulsoup4
 openpyxl
 pydantic
 uvicorn
+python-multipart
+
