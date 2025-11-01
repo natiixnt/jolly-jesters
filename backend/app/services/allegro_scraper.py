@@ -19,6 +19,7 @@ from ..config import PROXY_URL
 SELENIUM_URL = os.getenv("SELENIUM_URL", "http://selenium:4444/wd/hub")
 
 def _parse_price(price_text: str) -> float | None:
+    """Helper do parsowania ceny (usuwa 'zł', ' ', ',')"""
     try:
         txt = "".join(ch for ch in price_text if ch.isdigit() or ch in ".,")
         txt = txt.replace(",", ".").replace(" ", "")
@@ -27,6 +28,7 @@ def _parse_price(price_text: str) -> float | None:
         return None
 
 def _parse_sold_count(sold_text: str) -> int | None:
+    """Helper do parsowania liczby sprzedanych (np. '100 osób kupiło')"""
     try:
         match = re.search(r'\d+', sold_text.replace(' ', ''))
         return int(match.group(0)) if match else None
@@ -34,8 +36,13 @@ def _parse_sold_count(sold_text: str) -> int | None:
         return None
 
 def get_proxy_extension():
+    """
+    Tworzy rozszerzenie Chrome (wtyczkę) w pamięci, 
+    które obsługuje uwierzytelnianie proxy.
+    """
     if not PROXY_URL:
         return None
+
     try:
         creds, location = PROXY_URL.split("://")[1].split("@")
         user, password = creds.split(":")
@@ -91,7 +98,7 @@ def get_proxy_extension():
 
     chrome.webRequest.onAuthRequired.addListener(
                 callbackFn,
-                {{urls: ["<all_urls>"]}},
+                {{ "urls": ["<all_urls>"] }}, // <-- POPRAWKA (KROK 42): Dodano cudzysłowy wokół 'urls'
                 ['blocking']
     );
     """
@@ -107,8 +114,6 @@ def get_proxy_extension():
 def get_driver():
     """Tworzy instancję zdalnej przeglądarki Chrome w kontenerze Selenium"""
     options = ChromeOptions()
-    
-    # --- POPRAWKA (KROK 41): Ukrywanie Selenium ---
     
     # Tryb Headless (nowy sposób, trudniejszy do wykrycia)
     options.add_argument("--headless=new") 
@@ -126,8 +131,6 @@ def get_driver():
     
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
     
-    # --- KONIEC POPRAWKI ---
-
     proxy_extension = get_proxy_extension()
     if proxy_extension:
         options.add_encoded_extension(proxy_extension)
@@ -137,16 +140,14 @@ def get_driver():
         options=options
     )
     
-    # --- POPRAWKA (KROK 41): Dodatkowe ukrywanie ---
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}})")
-    # --- KONIEC POPRAWKI ---
     
     return driver
 
 
 def fetch_allegro_data(ean: str, use_api: bool = False, api_key: str = None):
     """
-    Scraper (Krok 41) używający Selenium z poprawnym uwierzytelnianiem proxy i maskowaniem.
+    Scraper (Krok 42) używający Selenium z poprawnym uwierzytelnianiem proxy i maskowaniem.
     """
     
     if use_api and api_key:
@@ -155,11 +156,9 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: str = None):
     driver = None
     try:
         driver = get_driver()
-        # Używamy linku wyszukiwania, który podałeś
         url = f"https://allegro.pl/listing?string={ean}"
         driver.get(url)
 
-        # Czekamy maksymalnie 10 sekund na pojawienie się pierwszej oferty
         wait = WebDriverWait(driver, 10)
         
         try:
@@ -189,7 +188,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: str = None):
             return {
                 "lowest_price": lowest_price, 
                 "sold_count": sold_count, 
-                "source": "selenium_stealth", # Zmieniamy source
+                "source": "selenium_stealth_v2", # Zmieniamy source
                 "fetched_at": datetime.utcnow(), 
                 "not_found": False
             }
@@ -197,7 +196,6 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: str = None):
             return {"lowest_price": None, "sold_count": None, "source": "failed", "fetched_at": datetime.utcnow(), "not_found": False}
 
     except Exception as e:
-        # Błąd (np. Timeout) oznacza, że strona się nie załadowała (prawdopodobnie przez blokadę)
         print(f"Błąd Selenium (EAN: {ean}): {e}")
         if driver:
             driver.quit()
