@@ -21,3 +21,9 @@ CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", 30)) # <-- TA ZMIENNA JEST KLUC
 PROFIT_MULTIPLIER = float(os.getenv("PROFIT_MULTIPLIER", 1.5))
 
 DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "PLN")
+
+# -----------------------
+# Ustawienia Proxy (Krok 27)
+# -----------------------
+# Adres URL do bramy proxy (np. http://uzytkownik:haslo@brama.proxy.com:port)
+PROXY_URL = os.getenv("PROXY_URL", None)
