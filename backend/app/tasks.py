@@ -151,6 +151,7 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             name_col = c_name
             price_col = c_price
             
+            # Tworzymy kopię wycinka, aby uniknąć SettingWithCopyWarning
             df = df.iloc[data_start_row:].copy() 
         
         missing_cols = []
@@ -161,8 +162,8 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         if missing_cols:
              raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
         
-        # --- POPRAWKA (KROK 32): Usunięcie błędnego bloku 'if not df.is_copy:' ---
-        # Ten blok powodował awarię AttributeError
+        # --- POPRAWKA (KROK 33): Usunięcie błędnego bloku 'if not df.is_copy:' ---
+        # Ten blok powodował awarię AttributeError.
         
         df.loc[:, "ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df.loc[:, "name_norm"] = df[name_col].astype(str).str.strip()
