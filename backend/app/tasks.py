@@ -26,6 +26,7 @@ def update_job_error(db: Session, job: models.ImportJob, message: str):
 # --- Funkcje pomocnicze do analizy (bez zmian) ---
 
 def find_header_row(df_head):
+    """Próbuje znaleźć indeks wiersza, który wygląda jak nagłówek"""
     ean_keys = ['ean', 'barcode', 'kod']
     name_keys = ['name', 'nazwa', 'title', 'tytuł']
     price_keys = ['price', 'cena', 'cost', 'koszt', 'netto']
@@ -42,10 +43,12 @@ def find_header_row(df_head):
     return 0 
 
 def is_ean(val):
+    """Sprawdza, czy wartość wygląda jak EAN (8, 12, 13 cyfr)"""
     s = str(val).strip()
     return s.isdigit() and len(s) in [8, 12, 13]
 
 def is_price(val):
+    """Sprawdza, czy wartość wygląda jak cena (pozwala na przecinki i kropki)"""
     if val is None: return False
     s = str(val).strip().replace(',', '.')
     if re.fullmatch(r"^-?\d+(\.\d+)?$", s):
@@ -57,6 +60,7 @@ def is_price(val):
     return False
 
 def find_columns_by_content(df, start_row):
+    """Analizuje zawartość DF (bez nagłówków) i zgaduje, które kolumny są które"""
     ean_col, name_col, price_col = None, None, None
     potential_cols = {} 
     
@@ -158,12 +162,9 @@ def parse_import_file(self, import_job_id: int, filepath: str):
              raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
         
         # --- POPRAWKA (KROK 32): Usunięcie błędnego bloku 'if not df.is_copy:' ---
-        # Ten blok powodował awarię AttributeError
+        # Wcześniejszy .copy() w bloku 'if not all' lub praca na oryginalnym DF jest wystarczająca.
+        # Użycie .loc zapobiegnie ostrzeżeniom.
         
-        # Zapewniamy, że pracujemy na kopii, aby .loc działał bez ostrzeżenia
-        if not df.is_copy:
-            df = df.copy()
-            
         df.loc[:, "ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df.loc[:, "name_norm"] = df[name_col].astype(str).str.strip()
         df.loc[:, "price_norm"] = pd.to_numeric(
