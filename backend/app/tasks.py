@@ -162,8 +162,7 @@ def parse_import_file(self, import_job_id: int, filepath: str):
              raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
         
         # --- POPRAWKA (KROK 32): Usunięcie błędnego bloku 'if not df.is_copy:' ---
-        # Wcześniejszy .copy() w bloku 'if not all' lub praca na oryginalnym DF jest wystarczająca.
-        # Użycie .loc zapobiegnie ostrzeżeniom.
+        # Ten blok powodował awarię AttributeError
         
         df.loc[:, "ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df.loc[:, "name_norm"] = df[name_col].astype(str).str.strip()
