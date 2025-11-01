@@ -14,7 +14,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 
-from ..config import PROXY_URL # Wciąż używamy proxy ze Smartproxy
+# Używamy ..config, aby wyjść z folderu 'services' do 'app'
+from ..config import PROXY_URL 
 
 # Adres serwera Selenium (z docker-compose.yml)
 SELENIUM_URL = os.getenv("SELENIUM_URL", "http://selenium:4444/wd/hub")
@@ -128,11 +129,10 @@ def get_driver():
     options.add_argument("--disable-extensions") # Wyłączamy domyślne rozszerzenia
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
 
-    # --- POPRAWKA (KROK 37): Dodanie wtyczki proxy ---
+    # --- POPRAWKA (KROK 39): Poprawna implementacja proxy ---
     proxy_extension = get_proxy_extension()
     if proxy_extension:
         options.add_encoded_extension(proxy_extension)
-    # Usunęliśmy błędne '--proxy-server'
     # --- KONIEC POPRAWKI ---
 
     driver = webdriver.Remote(
@@ -144,7 +144,7 @@ def get_driver():
 
 def fetch_allegro_data(ean: str, use_api: bool = False, api_key: str = None):
     """
-    Scraper (Krok 37) używający Selenium z poprawnym uwierzytelnianiem proxy.
+    Scraper (Krok 39) używający Selenium z poprawnym uwierzytelnianiem proxy.
     """
     
     if use_api and api_key:
@@ -190,7 +190,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: str = None):
             return {
                 "lowest_price": lowest_price, 
                 "sold_count": sold_count, 
-                "source": "selenium_proxy", # Zmieniamy source, żeby wiedzieć, że to ta wersja
+                "source": "selenium_proxy_v2", # Zmieniamy source, żeby wiedzieć, że to ta wersja
                 "fetched_at": datetime.utcnow(), 
                 "not_found": False
             }
