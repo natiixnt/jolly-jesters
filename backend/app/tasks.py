@@ -11,6 +11,7 @@ from .database import SessionLocal
 
 from . import models
 from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
+from .services.alerts import send_scraper_alert
 from .config import CACHE_TTL_DAYS 
 
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
@@ -26,7 +27,6 @@ def update_job_error(db: Session, job: models.ImportJob, message: str):
 # --- Funkcje pomocnicze do analizy (bez zmian) ---
 
 def find_header_row(df_head):
-    """Próbuje znaleźć indeks wiersza, który wygląda jak nagłówek"""
     ean_keys = ['ean', 'barcode', 'kod']
     name_keys = ['name', 'nazwa', 'title', 'tytuł']
     price_keys = ['price', 'cena', 'cost', 'koszt', 'netto']
@@ -43,12 +43,10 @@ def find_header_row(df_head):
     return 0 
 
 def is_ean(val):
-    """Sprawdza, czy wartość wygląda jak EAN (8, 12, 13 cyfr)"""
     s = str(val).strip()
     return s.isdigit() and len(s) in [8, 12, 13]
 
 def is_price(val):
-    """Sprawdza, czy wartość wygląda jak cena (pozwala na przecinki i kropki)"""
     if val is None: return False
     s = str(val).strip().replace(',', '.')
     if re.fullmatch(r"^-?\d+(\.\d+)?$", s):
@@ -60,7 +58,6 @@ def is_price(val):
     return False
 
 def find_columns_by_content(df, start_row):
-    """Analizuje zawartość DF (bez nagłówków) i zgaduje, które kolumny są które"""
     ean_col, name_col, price_col = None, None, None
     potential_cols = {} 
     
@@ -151,7 +148,6 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             name_col = c_name
             price_col = c_price
             
-            # Tworzymy kopię wycinka, aby uniknąć SettingWithCopyWarning
             df = df.iloc[data_start_row:].copy() 
         
         missing_cols = []
@@ -162,9 +158,7 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         if missing_cols:
              raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
         
-        # --- POPRAWKA (KROK 33): Usunięcie błędnego bloku 'if not df.is_copy:' ---
-        # Ten blok powodował awarię AttributeError.
-        
+        # Używamy .loc, aby uniknąć ostrzeżeń
         df.loc[:, "ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df.loc[:, "name_norm"] = df[name_col].astype(str).str.strip()
         df.loc[:, "price_norm"] = pd.to_numeric(
@@ -227,7 +221,7 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
         ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
 
         if cache and cache.fetched_at > ttl_limit:
-            if cache.source != 'failed' and cache.source != 'error':
+            if cache.source not in ['failed', 'error', 'ban_detected', 'captcha_detected']:
                 if cache.not_found:
                     p.status = "not_found"
                     p.notes = f"Cached not_found @ {cache.fetched_at.date()}"
@@ -238,18 +232,39 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
                 db.close()
                 return 
             
-        result = scraper_fetch(ean) 
-        
+        p.status = "processing"
+        db.commit()
+
+        result = scraper_fetch(ean)
+
         new_status = "done"
         notes = "Fetched via " + result["source"]
-        
-        if result["source"] == "failed":
+
+        if result["source"] in ["failed", "ban_detected", "captcha_detected"]:
             new_status = "error"
-            notes = "Scraping failed"
+            if result["source"] == "ban_detected":
+                notes = "Scraping blocked by Allegro"
+            elif result["source"] == "captcha_detected":
+                notes = "Scraping interrupted by CAPTCHA"
+            else:
+                notes = "Scraping failed"
+            if result.get("error"):
+                notes += f" ({result['error']})"
         elif result.get("not_found", False):
             new_status = "not_found"
             notes = "Product not found"
-            
+
+        if (
+            new_status == "error"
+            and result["source"] == "failed"
+            and result.get("error")
+            and not result.get("alert_sent")
+        ):
+            send_scraper_alert(
+                "allegro_scrape_failed",
+                {"ean": ean, "error": result["error"]},
+            )
+
         if not cache:
             cache = models.AllegroCache(ean=ean)
             db.add(cache)
