@@ -265,9 +265,31 @@ def parse_import_file(self, import_job_id: int, filepath: str):
 
         db.flush()
 
+        task_payloads: list[tuple[int, str]] = []
         for p in products_to_enqueue:
             p.status = "queued"
-            fetch_allegro_data.delay(p.id, p.ean)
+            task_payloads.append((p.id, p.ean))
+
+        db.commit()
+
+        try:
+            for product_id, product_ean in task_payloads:
+                fetch_allegro_data.delay(product_id, product_ean)
+        except Exception as exc:
+            db_error_session = SessionLocal()
+            job_to_update = (
+                db_error_session.query(models.ImportJob)
+                .filter(models.ImportJob.id == import_job_id)
+                .first()
+            )
+            if job_to_update:
+                update_job_error(
+                    db_error_session,
+                    job_to_update,
+                    f"Nie udało się zlecić zadań scrapera: {exc}",
+                )
+            db_error_session.close()
+            raise
 
         db.commit()
 
