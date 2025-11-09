@@ -488,6 +488,13 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             logger.exception("Błąd Selenium (attempt %s, EAN %s)", attempt, ean)
         finally:
             if driver:
+                # --- PAUZA DO DEBUGOWANIA ---
+                # Jeśli wystąpił błąd, zostawiamy przeglądarkę otwartą przez 30 sekund
+                # abyśmy mogli zobaczyć problem na VNC (port 7900).
+                if last_error:
+                    logger.warning("Wystąpił błąd. Pauza 30s na podgląd VNC...")
+                    time.sleep(30)
+                # --- KONIEC PAUZY ---
                 driver.quit()
 
         # backoff przed kolejną próbą

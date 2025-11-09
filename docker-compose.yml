@@ -14,6 +14,11 @@ services:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:  # <-- DODAJ TĘ SEKCJĘ
+      test: ["CMD-SHELL", "pg_isready -U pilot -d pilotdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7
@@ -21,6 +26,11 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
+    healthcheck:  # <-- DODAJ TĘ SEKCJĘ
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   # --- NOWA USŁUGA (KROK 34) ---
   selenium:
@@ -34,6 +44,12 @@ services:
       - "4444:4444" 
       # Port 7900 jest opcjonalny - możesz na nim podejrzeć przeglądarkę
       - "7900:7900" 
+    healthcheck:  # <-- DODAJ TĘ SEKCJĘ
+      test: ["CMD", "curl", "-f", "http://localhost:4444/wd/hub/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   backend:
     build:
@@ -49,9 +65,12 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - postgres
-      - redis
-      - selenium
+      postgres:
+        condition: service_healthy  # <-- ZMIEŃ TO
+      redis:
+        condition: service_healthy  # <-- ZMIEŃ TO
+      selenium:
+        condition: service_healthy  # <-- ZMIEŃ TO
 
   worker:
     build:
@@ -65,9 +84,12 @@ services:
       - ./backend:/app
       - workspace_data:/workspace
     depends_on:
-      - postgres
-      - redis
-      - selenium
+      postgres:
+        condition: service_healthy  # <-- ZMIEŃ TO
+      redis:
+        condition: service_healthy  # <-- ZMIEŃ TO
+      selenium:
+        condition: service_healthy  # <-- ZMIEŃ TO
 
   scraper_worker:
     build:
@@ -81,9 +103,12 @@ services:
       - ./backend:/app
       - workspace_data:/workspace
     depends_on:
-      - postgres
-      - redis
-      - selenium
+      postgres:
+        condition: service_healthy  # <-- ZMIEŃ TO
+      redis:
+        condition: service_healthy  # <-- ZMIEŃ TO
+      selenium:
+        condition: service_healthy  # <-- ZMIEŃ TO
 
   frontend:
     build:
