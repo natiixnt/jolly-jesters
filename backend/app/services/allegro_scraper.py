@@ -222,8 +222,8 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
 
     if proxy_url:
         proxy_argument, proxy_extension = _prepare_proxy(proxy_url)
-        #if proxy_argument:
-            #options.add_argument(f"--proxy-server={proxy_argument}")
+        if proxy_argument:
+            options.add_argument(f"--proxy-server={proxy_argument}")
         if proxy_extension:
             options.add_encoded_extension(proxy_extension)
 
