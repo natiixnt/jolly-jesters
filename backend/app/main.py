@@ -61,9 +61,23 @@ async def start_import(
     try:
         # Uruchamiamy zadanie Celery
         tasks.parse_import_file.delay(job.id, str(filepath))
-        # Aktualizujemy status w bazie (opcjonalne, bo parser też to robi)
-        job.status = "queued" 
-        db.commit()
+
+        # Ustawiamy status "queued" tylko jeśli zadanie nie zdążyło jeszcze
+        # przejść w stan "processing" (może się to stać bardzo szybko, zanim
+        # backend zdąży wykonać commit). Dzięki temu unikamy nadpisywania
+        # informacji ustawionej już przez worker.
+        rows_updated = (
+            db.query(models.ImportJob)
+            .filter(
+                models.ImportJob.id == job.id,
+                models.ImportJob.status.in_(["pending", "queued"]),
+            )
+            .update({"status": "queued"}, synchronize_session=False)
+        )
+        if rows_updated:
+            db.commit()
+        else:
+            db.rollback()
     except Exception as e:
         # Błąd przy kolejkowaniu (np. Redis nie działa)
         job.status = "error"
