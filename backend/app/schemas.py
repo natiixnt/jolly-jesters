@@ -37,6 +37,10 @@ class JobStatus(BaseModel):
     status: str
     meta: Optional[dict] = None
     notes: Optional[str] = None # <-- DODAJ TĘ LINIĘ
+    total_products: int = 0
+    completed_products: int = 0
+    processing_products: int = 0
+    queued_products: int = 0
 
 # -----------------------
 # Product input
