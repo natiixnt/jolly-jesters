@@ -19,7 +19,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from ..config import PROXY_URL
+from ..config import PROXY_URL, SELENIUM_HEADLESS
 from .alerts import send_scraper_alert
 
 # Adres serwera Selenium (z docker-compose.yml)
@@ -207,7 +207,10 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
     """Tworzy instancję zdalnej przeglądarki Chrome w kontenerze Selenium"""
     options = ChromeOptions()
 
-    options.add_argument("--headless=new")
+    if SELENIUM_HEADLESS:
+        options.add_argument("--headless=new")
+    else:
+        logger.info("Selenium running in non-headless mode (VNC debugging enabled)")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -488,13 +491,6 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             logger.exception("Błąd Selenium (attempt %s, EAN %s)", attempt, ean)
         finally:
             if driver:
-                # --- PAUZA DO DEBUGOWANIA ---
-                # Jeśli wystąpił błąd, zostawiamy przeglądarkę otwartą przez 30 sekund
-                # abyśmy mogli zobaczyć problem na VNC (port 7900).
-                if last_error:
-                    logger.warning("Wystąpił błąd. Pauza 30s na podgląd VNC...")
-                    time.sleep(30)
-                # --- KONIEC PAUZY ---
                 driver.quit()
 
         # backoff przed kolejną próbą

@@ -1,7 +1,9 @@
 # Plik: backend/app/config.py
 import os
-from dotenv import load_dotenv
 from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
 
 # ... (wczytanie .env tak jak masz)
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -31,4 +33,16 @@ DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "PLN")
 # Adres URL do bramy proxy (np. http://uzytkownik:haslo@brama.proxy.com:port)
 PROXY_URL = os.getenv("PROXY_URL", None)
 SCRAPER_ALERT_WEBHOOK = os.getenv("SCRAPER_ALERT_WEBHOOK")
+
+
+def _parse_bool(value: Optional[str], *, default: bool = True) -> bool:
+    """Parse bool-like environment flag values."""
+
+    if value is None:
+        return default
+
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+SELENIUM_HEADLESS = _parse_bool(os.getenv("SELENIUM_HEADLESS"), default=True)
 
