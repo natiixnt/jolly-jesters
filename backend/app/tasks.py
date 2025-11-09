@@ -4,15 +4,16 @@ import os
 import pandas as pd
 from celery import Celery
 from datetime import datetime, timedelta
-import re 
+import re
 
-from sqlalchemy.orm import Session 
-from .database import SessionLocal 
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+from .database import SessionLocal
 
 from . import models
 from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
 from .services.alerts import send_scraper_alert
-from .config import CACHE_TTL_DAYS 
+from .config import CACHE_TTL_DAYS
 
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery = Celery("app.tasks", broker=CELERY_BROKER)
@@ -22,6 +23,77 @@ def update_job_error(db: Session, job: models.ImportJob, message: str):
     """Pomocnik do aktualizowania statusu błędu w bazie"""
     job.status = "error"
     job.notes = message
+    db.commit()
+
+
+ACTIVE_STATUSES = {"pending", "queued", "processing"}
+
+
+def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
+    """Aktualizuje status zadania, jeśli wszystkie produkty zakończyły przetwarzanie."""
+
+    remaining = (
+        db.query(models.ProductInput)
+        .filter(
+            models.ProductInput.import_job_id == import_job_id,
+            models.ProductInput.status.in_(ACTIVE_STATUSES),
+        )
+        .count()
+    )
+
+    if remaining:
+        return
+
+    job = (
+        db.query(models.ImportJob)
+        .filter(models.ImportJob.id == import_job_id)
+        .first()
+    )
+    if not job:
+        return
+
+    total_products = (
+        db.query(func.count(models.ProductInput.id))
+        .filter(models.ProductInput.import_job_id == import_job_id)
+        .scalar()
+        or 0
+    )
+    error_count = (
+        db.query(func.count(models.ProductInput.id))
+        .filter(
+            models.ProductInput.import_job_id == import_job_id,
+            models.ProductInput.status == "error",
+        )
+        .scalar()
+        or 0
+    )
+    not_found_count = (
+        db.query(func.count(models.ProductInput.id))
+        .filter(
+            models.ProductInput.import_job_id == import_job_id,
+            models.ProductInput.status == "not_found",
+        )
+        .scalar()
+        or 0
+    )
+
+    if total_products == 0:
+        job.status = "error"
+        job.notes = "Brak produktów po przetwarzaniu."
+    elif error_count and error_count == total_products:
+        job.status = "error"
+        job.notes = "Wszystkie produkty zakończyły się błędem."
+    else:
+        job.status = "done"
+        if error_count:
+            job.notes = f"Zakończono z błędami: {error_count}/{total_products}."
+        elif not_found_count and not_found_count == total_products:
+            job.notes = "Żaden produkt nie został znaleziony na Allegro."
+        elif not_found_count:
+            job.notes = f"Zakończono. Nie znaleziono: {not_found_count}/{total_products}."
+        else:
+            job.notes = None
+
     db.commit()
 
 # --- Funkcje pomocnicze do analizy (bez zmian) ---
@@ -107,13 +179,17 @@ def parse_import_file(self, import_job_id: int, filepath: str):
     """
     Krok 1: Parsuje wgrany plik, tworzy ProductInput i kolejkuje zadania fetch_allegro_data
     """
-    db = SessionLocal() 
+    db = SessionLocal()
     job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
     if not job:
         db.close()
         return
 
     try:
+        job.status = "processing"
+        job.notes = None
+        db.commit()
+
         try:
             df = pd.read_excel(filepath, header=None, dtype=str) if filepath.lower().endswith(".xlsx") else pd.read_csv(filepath, header=None, dtype=str)
         except Exception as e:
@@ -157,8 +233,10 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         
         if missing_cols:
              raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
+
+        # --- POPRAWKA (KROK 33): Usunięcie błędnego bloku 'if not df.is_copy:' ---
+        # Ten blok powodował awarię AttributeError.
         
-        # Używamy .loc, aby uniknąć ostrzeżeń
         df.loc[:, "ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df.loc[:, "name_norm"] = df[name_col].astype(str).str.strip()
         df.loc[:, "price_norm"] = pd.to_numeric(
@@ -181,16 +259,17 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             )
             db.add(p)
             products_to_enqueue.append(p)
-            
+
         if not products_to_enqueue:
             raise ValueError("Nie znaleziono poprawnych wierszy w pliku (sprawdź, czy EAN i Ceny są wypełnione).")
 
-        job.status = "processing" 
-        db.commit() 
+        db.flush()
 
         for p in products_to_enqueue:
-            db.refresh(p) 
+            p.status = "queued"
             fetch_allegro_data.delay(p.id, p.ean)
+
+        db.commit()
 
     except (ValueError, Exception) as e:
         db.rollback()
@@ -215,7 +294,9 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
         p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
         if not p:
             db.close()
-            return 
+            return
+
+        import_job_id = p.import_job_id
 
         cache = db.query(models.AllegroCache).filter(models.AllegroCache.ean == ean).first()
         ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
@@ -277,8 +358,9 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
 
         p.status = new_status
         p.notes = notes
-        
+
         db.commit()
+        finalize_job_if_complete(db, import_job_id)
 
     except Exception as e:
         db.rollback()
@@ -286,6 +368,8 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
         if p:
             p.status = "error"
             p.notes = f"Błąd krytyczny workera: {e}"
+            import_job_id = p.import_job_id
             db.commit()
+            finalize_job_if_complete(db, import_job_id)
     finally:
         db.close()

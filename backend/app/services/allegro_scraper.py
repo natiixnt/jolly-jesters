@@ -16,6 +16,8 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 from ..config import PROXY_URL
 from .alerts import send_scraper_alert
@@ -42,6 +44,8 @@ PRICE_SELECTORS: List[str] = [
     "article[data-role='offer'] span.m9qz_fv",
     "article[data-role='offer'] span.m9qz_Fq",
     "article[data-role='offer'] span[data-analytics-interaction-value='price']",
+    "article[data-role='offer'] span[data-testid='ad-price']",
+    "article[data-role='offer'] span[data-testid='listing-ad-price']",
 ]
 
 SOLD_SELECTORS: List[str] = [
@@ -49,6 +53,7 @@ SOLD_SELECTORS: List[str] = [
     "article[data-role='offer'] span[data-analytics-interaction-value='sold-count']",
     "article[data-role='offer'] span[data-role='sold-counter']",
     "article[data-role='offer'] span[class*='sold']",
+    "article[data-role='offer'] span[data-testid='sold-counter']",
 ]
 
 BAN_KEYWORDS: List[str] = [
@@ -62,6 +67,12 @@ CAPTCHA_KEYWORDS: List[str] = [
     "captcha",
     "verify you are human",
     "potwierdź, że nie jesteś robotem",
+]
+
+CONSENT_BUTTON_SELECTORS: List[str] = [
+    "button[data-role='accept-consent']",
+    "button[data-testid='accept-consent-button']",
+    "button#didomi-notice-agree-button",
 ]
 
 NO_RESULTS_KEYWORDS: List[str] = [
@@ -254,6 +265,34 @@ def _detect_no_results(page_source: str) -> bool:
     return _contains_any(page_source, NO_RESULTS_KEYWORDS)
 
 
+def _accept_cookies(driver) -> bool:
+    """Próbuje zaakceptować zgodę na cookies, jeśli baner ją blokuje"""
+    for selector in CONSENT_BUTTON_SELECTORS:
+        try:
+            button = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+            )
+            button.click()
+            time.sleep(0.5)
+            return True
+        except Exception:
+            continue
+
+    # fallback na wyszukiwanie po tekście
+    try:
+        button = WebDriverWait(driver, 3).until(
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'przejdź do serwisu')]",
+            ))
+        )
+        button.click()
+        time.sleep(0.5)
+        return True
+    except Exception:
+        return False
+
+
 def _extract_price(driver, page_source: str) -> Optional[float]:
     """Pobiera najniższą cenę z listingu"""
     price_text = _find_first_text(driver, PRICE_SELECTORS)
@@ -265,6 +304,12 @@ def _extract_price(driver, page_source: str) -> Optional[float]:
     match = re.search(r'"price"\s*:\s*\{\s*"amount"\s*:\s*"([\d.,]+)"', page_source)
     if not match:
         match = re.search(r'"price"\s*:\s*\{\s*"value"\s*:\s*"([\d.,]+)"', page_source)
+    if match:
+        return _parse_price(match.group(1))
+
+    match = re.search(r'data-analytics-price\s*=\s*"([\d.,]+)"', page_source)
+    if not match:
+        match = re.search(r'"lowestPrice"\s*:\s*"([\d.,]+)"', page_source)
     if match:
         return _parse_price(match.group(1))
 
@@ -285,7 +330,31 @@ def _extract_sold_count(driver, page_source: str) -> Optional[int]:
             return int(match.group(1))
         except ValueError:
             return None
+
+    match = re.search(r'"soldQuantity"\s*:\s*(\d+)', page_source)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
     return None
+
+
+def _extract_listing_snapshot(driver) -> List[dict]:
+    """Pobiera z DOM kilka pierwszych ofert wraz z ceną i liczbą sprzedaży"""
+    try:
+        entries = driver.execute_script(
+            """
+            const offers = Array.from(document.querySelectorAll("article[data-role='offer']"));
+            return offers.slice(0, 5).map(offer => ({
+                price: (offer.querySelector("[data-role='price'], span[data-testid='ad-price'], span[data-testid='listing-ad-price']")?.textContent || '').trim(),
+                sold: (offer.querySelector("[data-role='sold-counter'], span[data-testid='sold-counter'], span[class*='sold']")?.textContent || '').trim()
+            }));
+            """
+        )
+        return entries or []
+    except Exception:
+        return []
 
 
 def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] = None):
@@ -316,8 +385,22 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             listing_url = f"https://allegro.pl/listing?string={ean}"
             driver.get(listing_url)
 
-            # krótkie oczekiwanie na załadowanie listingu
-            time.sleep(2 + random.uniform(0.5, 1.5))
+            _accept_cookies(driver)
+
+            try:
+                WebDriverWait(driver, 15).until(
+                    lambda d: (
+                        _detect_no_results(d.page_source)
+                        or bool(d.find_elements(By.CSS_SELECTOR, "article[data-role='offer']"))
+                    )
+                )
+            except TimeoutException as exc:
+                last_error = exc
+                logger.warning("Timeout oczekiwania na listing (attempt %s, EAN %s)", attempt, ean)
+                continue
+
+            # dodatkowy, krótki czas na pełne wczytanie komponentów cenowych
+            time.sleep(1 + random.uniform(0.2, 0.8))
 
             page_source = driver.page_source
 
@@ -368,6 +451,21 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "not_found": True,
                 }
 
+            listing_snapshot = _extract_listing_snapshot(driver)
+            if listing_snapshot:
+                for snapshot_entry in listing_snapshot:
+                    if snapshot_entry.get("price"):
+                        parsed_price = _parse_price(snapshot_entry["price"])
+                        if parsed_price is not None:
+                            sold_from_snapshot = _parse_sold_count(snapshot_entry.get("sold"))
+                            return {
+                                "lowest_price": parsed_price,
+                                "sold_count": sold_from_snapshot,
+                                "source": "selenium_rotating",
+                                "fetched_at": datetime.utcnow(),
+                                "not_found": False,
+                            }
+
             lowest_price = _extract_price(driver, page_source)
             sold_count = _extract_sold_count(driver, page_source)
 
@@ -379,6 +477,8 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "fetched_at": datetime.utcnow(),
                     "not_found": False,
                 }
+            else:
+                last_error = RuntimeError("Price not found in Allegro listing HTML")
 
         except TimeoutException as exc:
             last_error = exc
