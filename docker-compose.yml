@@ -63,7 +63,7 @@ services:
       context: ./backend
     container_name: pilot_worker
     command: >
-      sh -c "alembic upgrade head && celery -A app.tasks worker --loglevel=info --queues celery"
+      sh -c "celery -A app.tasks worker --loglevel=info --queues celery"
     volumes:
       - ./backend:/app
       - workspace_data:/workspace
@@ -83,7 +83,7 @@ services:
       context: ./backend
     container_name: pilot_scraper_worker
     command: >
-      sh -c "alembic upgrade head && celery -A app.tasks worker --loglevel=info --queues scraper"
+      sh -c "celery -A app.tasks worker --loglevel=info --queues scraper"
     volumes:
       - ./backend:/app
       - workspace_data:/workspace
