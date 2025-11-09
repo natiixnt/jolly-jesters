@@ -6,6 +6,7 @@ from celery import Celery
 from datetime import datetime, timedelta
 import re
 
+from kombu import Queue
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from .database import SessionLocal
@@ -17,6 +18,23 @@ from .config import CACHE_TTL_DAYS
 
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery = Celery("app.tasks", broker=CELERY_BROKER)
+
+# Ensure parsing jobs (default queue) are never starved behind a long backlog of
+# scraping jobs by routing the heavy Selenium work to a dedicated queue.
+celery.conf.task_default_queue = "celery"
+celery.conf.task_queues = (
+    Queue("celery", routing_key="celery"),
+    Queue("scraper", routing_key="scraper"),
+)
+celery.conf.task_routes = {
+    "app.tasks.fetch_allegro_data": {
+        "queue": "scraper",
+        "routing_key": "scraper",
+    }
+}
+# Prevent the worker from prefetching a large batch of scraping tasks at once –
+# this keeps at least one process free to pick up new parsing jobs quickly.
+celery.conf.worker_prefetch_multiplier = 1
 
 
 def update_job_error(db: Session, job: models.ImportJob, message: str):
@@ -290,8 +308,6 @@ def parse_import_file(self, import_job_id: int, filepath: str):
                 )
             db_error_session.close()
             raise
-
-        db.commit()
 
     except (ValueError, Exception) as e:
         db.rollback()
