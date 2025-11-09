@@ -114,25 +114,6 @@ services:
       - redis
       - selenium # Worker zależy od selenium
 
-  scraper_worker:
-    build:
-      context: ./backend
-    container_name: pilot_scraper_worker
-    command: >
-      sh -c "alembic upgrade head && celery -A app.tasks worker --loglevel=info --queues scraper"
-    volumes:
-      - ./backend:/app
-      - workspace_data:/workspace
-    environment:
-      - WORKSPACE=/workspace
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - DATABASE_URL=postgresql+psycopg2://pilot:pilot@postgres:5432/pilotdb
-      - SELENIUM_URL=http://selenium:4444/wd/hub
-      - SELENIUM_HEADLESS=${SELENIUM_HEADLESS:-1}
-    depends_on:
-      - postgres
-      - redis
-      - selenium
 
   frontend:
     build:
