@@ -8,7 +8,10 @@ env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 # ... (DATABASE_URL, CELERY_BROKER_URL, etc.)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://appuser:changeme@db:532/appdb")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://pilot:pilot@postgres:5432/pilotdb",
+)
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/0")
 
