@@ -9,7 +9,7 @@ import re
 import time
 import zipfile
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from selenium import webdriver
@@ -122,7 +122,9 @@ def _split_proxy_values() -> List[str]:
     return proxies
 
 
-def _build_proxy_extension(host: str, port: int, username: str, password: str) -> str:
+def _build_proxy_extension(
+    scheme: str, host: str, port: int, username: str, password: str
+) -> str:
     """Tworzy w locie rozszerzenie Chrome z uwierzytelnianiem proxy"""
     manifest_json = """
     {
@@ -151,11 +153,11 @@ def _build_proxy_extension(host: str, port: int, username: str, password: str) -
             mode: "fixed_servers",
             rules: {{
             singleProxy: {{
-                scheme: "http",
+                scheme: "{scheme}",
                 host: "{host}",
                 port: parseInt({port})
             }},
-            bypassList: ["localhost"]
+            bypassList: ["localhost", "127.0.0.1"]
             }}
         }};
 
@@ -173,7 +175,7 @@ def _build_proxy_extension(host: str, port: int, username: str, password: str) -
     chrome.webRequest.onAuthRequired.addListener(
                 callbackFn,
                 {{ "urls": ["<all_urls>"] }},
-                ['blocking']
+                ['blocking', 'asyncBlocking']
     );
     """
 
@@ -185,22 +187,32 @@ def _build_proxy_extension(host: str, port: int, username: str, password: str) -
     return base64.b64encode(zip_buffer.getvalue()).decode("utf-8")
 
 
-def _prepare_proxy(proxy_url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Zwraca argument proxy oraz ewentualne rozszerzenie z auth"""
+def _prepare_proxy(
+    proxy_url: str,
+) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, str]]]:
+    """Zwraca argument proxy, rozszerzenie oraz dodatkowe capability"""
     parsed = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
     host = parsed.hostname
     port = parsed.port
     if not host or not port:
-        return None, None
+        return None, None, None
 
     scheme = parsed.scheme or "http"
     proxy_argument = f"{scheme}://{host}:{port}"
 
     if parsed.username and parsed.password:
-        extension = _build_proxy_extension(host, port, parsed.username, parsed.password)
-        return proxy_argument, extension
+        extension = _build_proxy_extension(
+            scheme, host, port, parsed.username, parsed.password
+        )
+        credentials = f"{parsed.username}:{parsed.password}@{host}:{port}"
+        capability = {
+            "proxyType": "MANUAL",
+            "httpProxy": credentials,
+            "sslProxy": credentials,
+        }
+        return proxy_argument, extension, capability
 
-    return proxy_argument, None
+    return proxy_argument, None, None
 
 
 def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None):
@@ -224,11 +236,13 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         options.add_argument(f"user-agent={user_agent}")
 
     if proxy_url:
-        proxy_argument, proxy_extension = _prepare_proxy(proxy_url)
+        proxy_argument, proxy_extension, proxy_capability = _prepare_proxy(proxy_url)
         if proxy_argument:
             options.add_argument(f"--proxy-server={proxy_argument}")
         if proxy_extension:
             options.add_encoded_extension(proxy_extension)
+        if proxy_capability:
+            options.set_capability("proxy", proxy_capability)
 
     driver = webdriver.Remote(
         command_executor=SELENIUM_URL,
