@@ -6,6 +6,7 @@ import shutil
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from .database import Base, engine, get_db
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from . import models, tasks
 # Poprawka: Importujemy też config dla mnożnika
 from . import config 
@@ -93,13 +94,32 @@ def job_status(job_id: int, db: Session = Depends(get_db)):
     job = db.query(models.ImportJob).filter(models.ImportJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-        
+
+    status_counts = (
+        db.query(models.ProductInput.status, func.count(models.ProductInput.id))
+        .filter(models.ProductInput.import_job_id == job_id)
+        .group_by(models.ProductInput.status)
+        .all()
+    )
+
+    totals = {status: count for status, count in status_counts}
+    total_products = sum(totals.values())
+    completed_products = sum(
+        totals.get(s, 0) for s in ("done", "not_found", "error")
+    )
+    processing_products = totals.get("processing", 0)
+    queued_products = totals.get("pending", 0) + totals.get("queued", 0)
+
     # Zwracamy też notatki, jeśli wystąpił błąd
     return {
-        "id": job.id, 
-        "status": job.status, 
-        "meta": job.meta, 
-        "notes": getattr(job, 'notes', None) # Dodajemy notes do odpowiedzi
+        "id": job.id,
+        "status": job.status,
+        "meta": job.meta,
+        "notes": getattr(job, 'notes', None), # Dodajemy notes do odpowiedzi
+        "total_products": total_products,
+        "completed_products": completed_products,
+        "processing_products": processing_products,
+        "queued_products": queued_products,
     }
 
 

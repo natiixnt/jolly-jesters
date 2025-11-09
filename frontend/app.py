@@ -62,6 +62,10 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
             job_data = status_resp.json()
             status = job_data.get("status")
             notes = job_data.get("notes")
+            total_products = job_data.get("total_products", 0)
+            completed_products = job_data.get("completed_products", 0)
+            processing_products = job_data.get("processing_products", 0)
+            queued_products = job_data.get("queued_products", 0)
 
             # --- OSTATECZNA POPRAWKA LOGIKI PĘTLI ---
 
@@ -79,11 +83,19 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
 
             # Stan 3: W trakcie (jeśli nie ma jeszcze produktów)
             if not products:
-                if status in ["pending", "queued"]:
-                    status_text.info(f"Oczekiwanie na uruchomienie zadania... (Status: {status})")
-                elif status == "processing":
-                    status_text.info("Zadanie uruchomione, oczekiwanie na pierwsze wyniki...")
-                
+                if total_products:
+                    progress = int((completed_products / total_products) * 100)
+                    progress_bar.progress(progress)
+                    status_text.info(
+                        f"Postęp: {progress}% (Zakończono {completed_products} z {total_products}. "
+                        f"W kolejce: {queued_products}, w trakcie: {processing_products})"
+                    )
+                else:
+                    if status in ["pending", "queued"]:
+                        status_text.info(f"Oczekiwanie na uruchomienie zadania... (Status: {status})")
+                    elif status == "processing":
+                        status_text.info("Zadanie uruchomione, oczekiwanie na pierwsze wyniki...")
+
                 time.sleep(3)
                 continue # Sprawdź status ponownie
 
@@ -95,9 +107,18 @@ if "job_id" in st.session_state and not st.session_state.get("stop_polling", Fal
             total = len(df)
             done = len(df[df["status"].isin(["done", "not_found", "error"])])
             progress = int((done / total) * 100) if total > 0 else 0
-            
+
+            # Użyj danych z backendu, jeśli istnieją (np. gdy tabela jest filtrowana)
+            if total_products:
+                progress = int((completed_products / total_products) * 100)
+                done = completed_products
+                total = total_products
+
             progress_bar.progress(progress)
-            status_text.info(f"Postęp: {progress}% (Przetworzono {done} z {total})")
+            status_text.info(
+                f"Postęp: {progress}% (Przetworzono {done} z {total}; "
+                f"W kolejce: {queued_products}, w trakcie: {processing_products})"
+            )
 
             def color_recommendation(val):
                 if val == "opłacalny": return "background-color: #b2f0b2"
