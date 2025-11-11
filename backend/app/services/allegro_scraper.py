@@ -19,7 +19,7 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.proxy import Proxy  # <--- DODAJ TĘ LINIĘ
+from selenium.webdriver.common.proxy import Proxy, ProxyType # <--- DODAJ TĘ LINIĘ
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
