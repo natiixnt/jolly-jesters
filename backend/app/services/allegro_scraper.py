@@ -291,8 +291,11 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         proxy_host_port = proxy_url.split("://")[-1]
 
         # Tworzymy poprawny obiekt Proxy
+        # Tworzymy poprawny obiekt Proxy
         proxy = Proxy()
-        proxy.proxy_type = "MANUAL"
+        # NAJPIERW ustawiamy typ
+        proxy.proxy_type = ProxyType.MANUAL
+        # POTEM ustawiamy stringi
         proxy.http_proxy = proxy_host_port
         proxy.ssl_proxy = proxy_host_port
         
