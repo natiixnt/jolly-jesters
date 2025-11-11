@@ -12,6 +12,9 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import requests
+from requests import Response
+from requests.exceptions import RequestException
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -27,10 +30,50 @@ from ..config import (
 )
 from .alerts import send_scraper_alert
 
-# Adres serwera Selenium (z docker-compose.yml)
 SELENIUM_URL = os.getenv("SELENIUM_URL", "http://selenium:4444/wd/hub")
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
+SELENIUM_READY_TIMEOUT = int(os.getenv("SELENIUM_READY_TIMEOUT", "30"))
+
+
+def _selenium_status_url() -> str:
+    explicit = os.getenv("SELENIUM_STATUS_URL")
+    if explicit:
+        return explicit
+
+    base = SELENIUM_URL
+    if base.endswith("/wd/hub"):
+        base = base[: -len("/wd/hub")]
+    return f"{base}/status"
+
+
+def _wait_for_selenium_ready(timeout: int = SELENIUM_READY_TIMEOUT) -> None:
+    """Blokuje do momentu aż Selenium Grid zgłosi gotowość lub minie timeout."""
+
+    status_url = _selenium_status_url()
+    deadline = time.time() + timeout
+    last_error: Optional[Exception] = None
+
+    while time.time() < deadline:
+        try:
+            response: Response = requests.get(status_url, timeout=3)
+            if response.status_code == 200:
+                payload = response.json()
+                ready = payload.get("value", {}).get("ready")
+                if ready is None:
+                    ready = payload.get("ready")
+                if ready:
+                    return
+        except RequestException as exc:
+            last_error = exc
+        except ValueError as exc:  # invalid JSON
+            last_error = exc
+
+        time.sleep(1)
+
+    raise RuntimeError(
+        f"Selenium status not ready after {timeout}s (last error: {last_error})"
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +291,8 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
             options.add_encoded_extension(proxy_extension)
         if proxy_capability:
             options.set_capability("proxy", proxy_capability)
+
+    _wait_for_selenium_ready()
 
     driver = webdriver.Remote(
         command_executor=SELENIUM_URL,
