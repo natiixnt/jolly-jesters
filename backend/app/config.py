@@ -32,6 +32,8 @@ DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "PLN")
 # -----------------------
 # Adres URL do bramy proxy (np. http://uzytkownik:haslo@brama.proxy.com:port)
 PROXY_URL = os.getenv("PROXY_URL", None)
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 SCRAPER_ALERT_WEBHOOK = os.getenv("SCRAPER_ALERT_WEBHOOK")
 
 

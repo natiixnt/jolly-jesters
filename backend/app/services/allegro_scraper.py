@@ -19,7 +19,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from ..config import PROXY_URL, SELENIUM_HEADLESS
+from ..config import (
+    PROXY_PASSWORD,
+    PROXY_URL,
+    PROXY_USERNAME,
+    SELENIUM_HEADLESS,
+)
 from .alerts import send_scraper_alert
 
 # Adres serwera Selenium (z docker-compose.yml)
@@ -200,15 +205,15 @@ def _prepare_proxy(
     scheme = parsed.scheme or "http"
     proxy_argument = f"{scheme}://{host}:{port}"
 
-    if parsed.username and parsed.password:
-        extension = _build_proxy_extension(
-            scheme, host, port, parsed.username, parsed.password
-        )
-        credentials = f"{parsed.username}:{parsed.password}@{host}:{port}"
+    username = parsed.username or PROXY_USERNAME
+    password = parsed.password or PROXY_PASSWORD
+
+    if username and password:
+        extension = _build_proxy_extension(scheme, host, port, username, password)
         capability = {
-            "proxyType": "MANUAL",
-            "httpProxy": credentials,
-            "sslProxy": credentials,
+            "proxyType": "manual",
+            "httpProxy": f"{host}:{port}",
+            "sslProxy": f"{host}:{port}",
         }
         return proxy_argument, extension, capability
 
