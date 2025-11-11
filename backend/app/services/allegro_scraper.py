@@ -284,13 +284,16 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         options.add_argument(f"user-agent={user_agent}")
 
     if proxy_url:
-        proxy_argument, proxy_extension, proxy_capability = _prepare_proxy(proxy_url)
-        if proxy_argument:
-            options.add_argument(f"--proxy-server={proxy_argument}")
-        if proxy_extension:
-            options.add_encoded_extension(proxy_extension)
-        if proxy_capability:
-            options.set_capability("proxy", proxy_capability)
+        logger.info("Using proxy: %s (via modern options.proxy)", proxy_url)
+        # Usuwamy "http://" lub "https://" z początku, Selenium 4 tego nie lubi
+        proxy_host_port = proxy_url.split("://")[-1]
+        
+        options.proxy = {
+            "proxyType": "MANUAL",
+            "httpProxy": proxy_host_port,
+            "sslProxy": proxy_host_port,
+            "noProxy": "localhost,127.0.0.1,selenium,pilot_postgres,pilot_redis", # Ignoruj proxy dla usług lokalnych
+        }
 
     _wait_for_selenium_ready()
 
