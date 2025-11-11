@@ -19,6 +19,7 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.proxy import Proxy  # <--- DODAJ TĘ LINIĘ
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -285,15 +286,18 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
 
     if proxy_url:
         logger.info("Using proxy: %s (via modern options.proxy)", proxy_url)
-        # Usuwamy "http://" lub "https://" z początku, Selenium 4 tego nie lubi
-        proxy_host_port = proxy_url.split("://")[-1]
         
-        options.proxy = {
-            "proxyType": "MANUAL",
-            "httpProxy": proxy_host_port,
-            "sslProxy": proxy_host_port,
-            "noProxy": "localhost,127.0.0.1,selenium,pilot_postgres,pilot_redis", # Ignoruj proxy dla usług lokalnych
-        }
+        # Usuwamy "http://" lub "https://" z początku
+        proxy_host_port = proxy_url.split("://")[-1]
+
+        # Tworzymy poprawny obiekt Proxy
+        proxy = Proxy()
+        proxy.proxy_type = "MANUAL"
+        proxy.http_proxy = proxy_host_port
+        proxy.ssl_proxy = proxy_host_port
+        
+        # To jest poprawny sposób ustawienia proxy w Selenium 4
+        options.proxy = proxy
 
     _wait_for_selenium_ready()
 
