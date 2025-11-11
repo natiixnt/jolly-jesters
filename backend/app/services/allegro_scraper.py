@@ -284,13 +284,35 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
     if user_agent:
         options.add_argument(f"user-agent={user_agent}")
 
+    def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None):
+        """Tworzy instancję zdalnej przeglądarki Chrome w kontenerze Selenium"""
+    options = ChromeOptions()
+    
+    # Ustawiamy tryb VNC (non-headless) do debugowania
+    # Zamiast --headless=new, po prostu go nie dodajemy
+    # options.add_argument("--headless=new") 
+    logger.info("Selenium running in non-headless mode (VNC debugging enabled)")
+
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("start-maximized")
+    options.add_argument("disable-infobars")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    if user_agent:
+        options.add_argument(f"user-agent={user_agent}")
+
+    # --- NOWA KONFIGURACJA PROXY (SELENIUM-WIRE) ---
+    seleniumwire_options = {}
     if proxy_url:
-        logger.info("Using proxy: %s (via modern options.proxy)", proxy_url)
+        logger.info("Using proxy: %s (via Proxy object)", proxy_url)
         
         # Usuwamy "http://" lub "https://" z początku
         proxy_host_port = proxy_url.split("://")[-1]
 
-        # Tworzymy poprawny obiekt Proxy
         # Tworzymy poprawny obiekt Proxy
         proxy = Proxy()
         # NAJPIERW ustawiamy typ
@@ -301,13 +323,14 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         
         # To jest poprawny sposób ustawienia proxy w Selenium 4
         options.proxy = proxy
-
-    _wait_for_selenium_ready()
-
+        
+    # UWAGA: Używamy teraz `webdriver.Remote` z `seleniumwire`
     driver = webdriver.Remote(
         command_executor=SELENIUM_URL,
         options=options,
+        seleniumwire_options=seleniumwire_options  # <-- Kluczowa zmiana
     )
+    # --- KONIEC NOWEJ KONFIGURACJI ---
 
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     driver.set_page_load_timeout(30)

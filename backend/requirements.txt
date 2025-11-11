@@ -17,3 +17,4 @@ python-multipart
 curl_cffi # <-- DODAJ TĘ LINIĘ
 selenium # <-- DODAJ TĘ LINIĘ
 webdriver-manager # <-- DODAJ TĘ LINIĘ
+selenium-wire
