@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import requests
 from requests import Response
 from requests.exceptions import RequestException
-from selenium import webdriver
+from seleniumwire import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
@@ -174,29 +174,29 @@ def _split_proxy_values() -> List[str]:
 def _build_proxy_extension(
     scheme: str, host: str, port: int, username: str, password: str
 ) -> str:
-    """Tworzy w locie rozszerzenie Chrome z uwierzytelnianiem proxy"""
-    manifest_json = """
-    {
+    """Tworzy w locie rozszerzenie Chrome z uwierzytelnianiem proxy (Manifest V3)"""
+
+    # ZMIANA: Manifest V3
+    manifest_json = f"""
+    {{
         "version": "1.0.0",
-        "manifest_version": 2,
+        "manifest_version": 3,
         "name": "Chrome Proxy",
         "permissions": [
             "proxy",
-            "tabs",
-            "unlimitedStorage",
-            "storage",
-            "<all_urls>",
             "webRequest",
-            "webRequestBlocking"
+            "webRequestAuthProvider"
         ],
-        "background": {
-            "scripts": ["background.js"]
-        },
-        "minimum_chrome_version":"22.0.0"
-    }
+        "host_permissions": [
+            "<all_urls>"
+        ],
+        "background": {{
+            "service_worker": "background.js"
+        }}
+    }}
     """
 
-    # --- POPRAWKA (KROK 46): Usunięcie podwójnych nawiasów klamrowych ---
+    # Ta logika jest poprawna - łączy V3 'proxy.settings' z 'webRequest'
     background_js = f"""
     var config = {{
             mode: "fixed_servers",
@@ -224,7 +224,7 @@ def _build_proxy_extension(
     chrome.webRequest.onAuthRequired.addListener(
                 callbackFn,
                 {{ "urls": ["<all_urls>"] }},
-                ['blocking', 'asyncBlocking']
+                ['asyncBlocking']
     );
     """
 
@@ -272,26 +272,6 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         options.add_argument("--headless=new")
     else:
         logger.info("Selenium running in non-headless mode (VNC debugging enabled)")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("start-maximized")
-    options.add_argument("disable-infobars")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-
-    if user_agent:
-        options.add_argument(f"user-agent={user_agent}")
-
-    def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None):
-        """Tworzy instancję zdalnej przeglądarki Chrome w kontenerze Selenium"""
-    options = ChromeOptions()
-    
-    # Ustawiamy tryb VNC (non-headless) do debugowania
-    # Zamiast --headless=new, po prostu go nie dodajemy
-    # options.add_argument("--headless=new") 
-    logger.info("Selenium running in non-headless mode (VNC debugging enabled)")
 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -305,32 +285,23 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
     if user_agent:
         options.add_argument(f"user-agent={user_agent}")
 
-    # --- NOWA KONFIGURACJA PROXY (SELENIUM-WIRE) ---
-    seleniumwire_options = {}
+    # --- LOGIKA PROXY (Metoda z rozszerzeniem V3) ---
     if proxy_url:
-        logger.info("Using proxy: %s (via Proxy object)", proxy_url)
-        
-        # Usuwamy "http://" lub "https://" z początku
-        proxy_host_port = proxy_url.split("://")[-1]
+        # _prepare_proxy użyje _build_proxy_extension do stworzenia V3 manifestu
+        proxy_argument, extension, capability = _prepare_proxy(proxy_url)
 
-        # Tworzymy poprawny obiekt Proxy
-        proxy = Proxy()
-        # NAJPIERW ustawiamy typ
-        proxy.proxy_type = ProxyType.MANUAL
-        # POTEM ustawiamy stringi
-        proxy.http_proxy = proxy_host_port
-        proxy.ssl_proxy = proxy_host_port
-        
-        # To jest poprawny sposób ustawienia proxy w Selenium 4
-        options.proxy = proxy
-        
-    # UWAGA: Używamy teraz `webdriver.Remote` z `seleniumwire`
+        if extension:
+            logger.info("Using proxy via encoded extension (with auth).")
+            options.add_encoded_extension(extension)
+        elif proxy_argument:
+            logger.warning("Using proxy via argument (no auth).")
+            options.add_argument(f"--proxy-server={proxy_argument}")
+    # --- KONIEC ---
+
     driver = webdriver.Remote(
         command_executor=SELENIUM_URL,
-        options=options,
-        seleniumwire_options=seleniumwire_options  # <-- Kluczowa zmiana
+        options=options
     )
-    # --- KONIEC NOWEJ KONFIGURACJI ---
 
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     driver.set_page_load_timeout(30)
