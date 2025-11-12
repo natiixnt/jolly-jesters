@@ -21,7 +21,7 @@ class EnsureSeleniumReadyTests(unittest.TestCase):
         with patch("backend.app.services.allegro_scraper.SELENIUM_URL_CANDIDATES", candidates):
             with patch(
                 "backend.app.services.allegro_scraper._wait_for_candidate_ready",
-                side_effect=[RuntimeError("boom"), None],
+                side_effect=[scraper.SeleniumEndpointUnavailable("boom"), None],
             ) as mock_wait:
                 selected = scraper._ensure_selenium_ready(timeout=1)
 
@@ -35,9 +35,9 @@ class EnsureSeleniumReadyTests(unittest.TestCase):
         with patch("backend.app.services.allegro_scraper.SELENIUM_URL_CANDIDATES", candidates):
             with patch(
                 "backend.app.services.allegro_scraper._wait_for_candidate_ready",
-                side_effect=RuntimeError("nope"),
+                side_effect=scraper.SeleniumEndpointUnavailable("nope"),
             ):
-                with self.assertRaises(RuntimeError) as ctx:
+                with self.assertRaises(scraper.SeleniumEndpointUnavailable) as ctx:
                     scraper._ensure_selenium_ready(timeout=1)
 
         message = str(ctx.exception)
@@ -52,7 +52,7 @@ class WaitForCandidateReadyTests(unittest.TestCase):
         err.__cause__ = socket.gaierror("Name or service not known")
 
         with patch("backend.app.services.allegro_scraper.requests.get", side_effect=err) as mock_get:
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(scraper.SeleniumEndpointUnavailable) as ctx:
                 scraper._wait_for_candidate_ready("http://selenium:4444/wd/hub", timeout=5)
 
         self.assertIn("Nie można rozwiązać nazwy hosta", str(ctx.exception))
@@ -65,10 +65,26 @@ class WaitForCandidateReadyTests(unittest.TestCase):
         err.__cause__ = nested
 
         with patch("backend.app.services.allegro_scraper.requests.get", side_effect=err) as mock_get:
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(scraper.SeleniumEndpointUnavailable):
                 scraper._wait_for_candidate_ready("http://selenium:4444/wd/hub", timeout=5)
 
         self.assertEqual(mock_get.call_count, 1)
+
+
+class FetchDataRetryTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        scraper._ACTIVE_SELENIUM_URL = None
+
+    def test_infrastructure_failure_breaks_retry_loop(self):
+        with patch(
+            "backend.app.services.allegro_scraper.get_driver",
+            side_effect=scraper.SeleniumEndpointUnavailable("dns"),
+        ) as mock_driver:
+            result = scraper.fetch_allegro_data("1234567890123")
+
+        self.assertEqual(mock_driver.call_count, 1)
+        self.assertEqual(result["source"], "failed")
+        self.assertIn("dns", result.get("error", ""))
 
 
 if __name__ == "__main__":

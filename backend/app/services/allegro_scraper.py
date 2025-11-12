@@ -66,6 +66,10 @@ MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
 SELENIUM_READY_TIMEOUT = int(os.getenv("SELENIUM_READY_TIMEOUT", "30"))
 
+class SeleniumEndpointUnavailable(RuntimeError):
+    """Sygnałizuje brak dostępnego endpointu Selenium."""
+
+
 _UNPATCHED_REMOTE_CACHE: Optional[type] = None
 _ACTIVE_SELENIUM_URL: Optional[str] = None
 
@@ -158,7 +162,7 @@ def _wait_for_candidate_ready(base_url: str, timeout: int) -> None:
             if isinstance(exc, RequestsConnectionError):
                 dns_error = _find_dns_error(exc)
                 if dns_error is not None:
-                    raise RuntimeError(
+                    raise SeleniumEndpointUnavailable(
                         f"Nie można rozwiązać nazwy hosta dla {status_url}: {dns_error}"
                     ) from exc
         except ValueError as exc:
@@ -166,7 +170,7 @@ def _wait_for_candidate_ready(base_url: str, timeout: int) -> None:
 
         time.sleep(1)
 
-    raise RuntimeError(
+    raise SeleniumEndpointUnavailable(
         f"Selenium status not ready after {timeout}s (last error: {last_error})"
     )
 
@@ -185,11 +189,14 @@ def _ensure_selenium_ready(timeout: int = SELENIUM_READY_TIMEOUT) -> str:
             _ACTIVE_SELENIUM_URL = candidate
             logger.info("Selenium endpoint selected: %s", candidate)
             return candidate
+        except SeleniumEndpointUnavailable as exc:
+            last_error = exc
+            logger.warning("Selenium endpoint %s failed readiness check: %s", candidate, exc)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             logger.warning("Selenium endpoint %s failed readiness check: %s", candidate, exc)
 
-    raise RuntimeError(
+    raise SeleniumEndpointUnavailable(
         "Brak dostępnego endpointu Selenium. Próbowano: "
         + ", ".join(SELENIUM_URL_CANDIDATES)
         + (f". Ostatni błąd: {last_error}" if last_error else "")
@@ -717,6 +724,10 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
         except TimeoutException as exc:
             last_error = exc
             logger.warning("Timeout Selenium (attempt %s, EAN %s): %s", attempt, ean, exc)
+        except SeleniumEndpointUnavailable as exc:
+            last_error = exc
+            logger.error("Błąd infrastruktury Selenium (attempt %s, EAN %s): %s", attempt, ean, exc)
+            break
         except Exception as exc:
             last_error = exc
             logger.exception("Błąd Selenium (attempt %s, EAN %s)", attempt, ean)
