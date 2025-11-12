@@ -29,7 +29,9 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
 except ImportError:  # pragma: no cover - executed only when selenium is absent
-    TimeoutException = Exception  # type: ignore
+    class TimeoutException(Exception):  # type: ignore
+        """Minimal substytut TimeoutException gdy Selenium nie jest dostępne."""
+
 
     class _MissingSeleniumProxy:
         """Fallback callable that raises a helpful error when Selenium is required."""
