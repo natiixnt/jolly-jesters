@@ -17,12 +17,37 @@ from urllib.parse import urlparse
 import requests
 from requests import Response
 from requests.exceptions import RequestException
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
+
+try:
+    from selenium.common.exceptions import TimeoutException
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
+except ImportError:  # pragma: no cover - executed only when selenium is absent
+    TimeoutException = Exception  # type: ignore
+
+    class _MissingSeleniumProxy:
+        """Fallback callable that raises a helpful error when Selenium is required."""
+
+        _MESSAGE = (
+            "Selenium package is required to run the Allegro scraper. "
+            "Install selenium or execute this code in the runtime environment "
+            "that provides it."
+        )
+
+        def __call__(self, *args, **kwargs):  # noqa: D401 - behaviour documented in _MESSAGE
+            raise RuntimeError(self._MESSAGE)
+
+        def __getattr__(self, item):
+            raise RuntimeError(self._MESSAGE)
+
+    ChromeOptions = _MissingSeleniumProxy()  # type: ignore
+    By = _MissingSeleniumProxy()  # type: ignore
+    EC = _MissingSeleniumProxy()  # type: ignore
+    WebDriverWait = _MissingSeleniumProxy()  # type: ignore
+    RemoteWebDriver = _MissingSeleniumProxy()  # type: ignore
 
 from ..config import (
     PROXY_PASSWORD,
