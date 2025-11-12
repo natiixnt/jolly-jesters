@@ -1,11 +1,13 @@
 # Plik: backend/app/services/allegro_scraper.py
 
 import base64
+import importlib.util
 import io
 import logging
 import os
 import random
 import re
+import sys
 import time
 import zipfile
 from datetime import datetime
@@ -34,6 +36,8 @@ SELENIUM_URL = os.getenv("SELENIUM_URL", "http://selenium:4444/wd/hub")
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
 SELENIUM_READY_TIMEOUT = int(os.getenv("SELENIUM_READY_TIMEOUT", "30"))
+
+_UNPATCHED_REMOTE_CACHE: Optional[type] = None
 
 
 def _selenium_status_url() -> str:
@@ -74,6 +78,40 @@ def _wait_for_selenium_ready(timeout: int = SELENIUM_READY_TIMEOUT) -> None:
     raise RuntimeError(
         f"Selenium status not ready after {timeout}s (last error: {last_error})"
     )
+
+
+def _load_unpatched_remote_webdriver() -> type:
+    """Ładuje oryginalną klasę RemoteWebDriver z Selenium z pominięciem patchy."""
+
+    global _UNPATCHED_REMOTE_CACHE
+
+    if _UNPATCHED_REMOTE_CACHE is not None:
+        return _UNPATCHED_REMOTE_CACHE
+
+    spec = importlib.util.find_spec("selenium.webdriver.remote.webdriver")
+    if spec is None or not spec.origin:
+        raise RuntimeError("Nie można odnaleźć modułu selenium.webdriver.remote.webdriver")
+
+    module_name = "_selenium_unpatched_remote_webdriver"
+    module_spec = importlib.util.spec_from_file_location(module_name, spec.origin)
+    if module_spec is None or module_spec.loader is None:
+        raise RuntimeError("Nie udało się przygotować specyfikacji modułu RemoteWebDriver")
+
+    module = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_name] = module
+    try:
+        module_spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    try:
+        remote_cls = getattr(module, "WebDriver")
+    except AttributeError as exc:
+        raise RuntimeError("Załadowany moduł nie zawiera klasy WebDriver") from exc
+
+    _UNPATCHED_REMOTE_CACHE = remote_cls
+    return remote_cls
+
 
 logger = logging.getLogger(__name__)
 
@@ -292,10 +330,25 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
 
     _wait_for_selenium_ready()
 
-    driver = RemoteWebDriver(
-        command_executor=SELENIUM_URL,
-        options=options,
-    )
+    driver_factory = RemoteWebDriver
+    try:
+        driver = driver_factory(
+            command_executor=SELENIUM_URL,
+            options=options,
+        )
+    except TypeError as exc:
+        if "desired_capabilities" not in str(exc):
+            raise
+
+        logger.warning(
+            "RemoteWebDriver zgłosił TypeError dotyczący desired_capabilities, próbuję ponownie z klasą bez patchy: %s",
+            exc,
+        )
+        driver_factory = _load_unpatched_remote_webdriver()
+        driver = driver_factory(
+            command_executor=SELENIUM_URL,
+            options=options,
+        )
 
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     driver.set_page_load_timeout(30)
