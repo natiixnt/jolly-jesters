@@ -513,10 +513,10 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         proxy_argument, proxy_extension, proxy_capability = _prepare_proxy(proxy_url)
         #if proxy_argument:
             #options.add_argument(f"--proxy-server={proxy_argument}")
-        if proxy_extension:
-            options.add_encoded_extension(proxy_extension)
-       # if proxy_capability:
-            #options.set_capability("proxy", proxy_capability)
+        #if proxy_extension:
+        #    options.add_encoded_extension(proxy_extension)
+        if proxy_capability:
+            options.set_capability("proxy", proxy_capability)
 
     selenium_endpoint = _ensure_selenium_ready()
 
