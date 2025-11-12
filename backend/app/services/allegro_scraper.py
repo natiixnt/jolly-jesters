@@ -107,6 +107,36 @@ def _selenium_status_url(base_url: str) -> str:
     return f"{base}/status"
 
 
+def _iter_causes(exc: Exception):
+    """Yields an exception and its chained causes/contexts without cycling."""
+
+    seen = set()
+    queue = [exc]
+
+    while queue:
+        current = queue.pop(0)
+        if current is None or id(current) in seen:
+            continue
+
+        yield current
+        seen.add(id(current))
+        queue.append(getattr(current, "__cause__", None))
+        queue.append(getattr(current, "__context__", None))
+
+
+def _find_dns_error(exc: Exception) -> Optional[BaseException]:
+    """Returns the first DNS-related cause in the exception chain, if any."""
+
+    for cause in _iter_causes(exc):
+        if isinstance(cause, (NameResolutionError, socket.gaierror)):
+            return cause
+
+        reason = getattr(cause, "reason", None)
+        if isinstance(reason, (NameResolutionError, socket.gaierror)):
+            return reason
+    return None
+
+
 def _wait_for_candidate_ready(base_url: str, timeout: int) -> None:
     deadline = time.time() + timeout
     last_error: Optional[Exception] = None
@@ -124,22 +154,12 @@ def _wait_for_candidate_ready(base_url: str, timeout: int) -> None:
                     return
         except RequestException as exc:
             last_error = exc
-            cause = getattr(exc, "__cause__", None)
 
             if isinstance(exc, RequestsConnectionError):
-                # Name resolution errors do not benefit from additional retries and
-                # we can immediately fall back to another Selenium candidate.
-                fatal = isinstance(cause, NameResolutionError) or isinstance(
-                    getattr(cause, "__cause__", None), socket.gaierror
-                )
-                if not fatal and isinstance(cause, RequestsConnectionError):
-                    fatal = isinstance(
-                        getattr(cause, "__cause__", None), socket.gaierror
-                    )
-
-                if fatal:
+                dns_error = _find_dns_error(exc)
+                if dns_error is not None:
                     raise RuntimeError(
-                        f"Nie można rozwiązać nazwy hosta dla {status_url}: {cause}"
+                        f"Nie można rozwiązać nazwy hosta dla {status_url}: {dns_error}"
                     ) from exc
         except ValueError as exc:
             last_error = exc

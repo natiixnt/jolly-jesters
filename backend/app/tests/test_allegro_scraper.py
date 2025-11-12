@@ -1,6 +1,10 @@
 import unittest
 from unittest.mock import patch
 
+import socket
+
+from requests.exceptions import ConnectionError as RequestsConnectionError
+
 import backend.app.services.allegro_scraper as scraper
 
 
@@ -40,6 +44,31 @@ class EnsureSeleniumReadyTests(unittest.TestCase):
         self.assertIn("http://bad-grid", message)
         self.assertIn("nope", message)
         self.assertIsNone(scraper._ACTIVE_SELENIUM_URL)
+
+
+class WaitForCandidateReadyTests(unittest.TestCase):
+    def test_dns_error_is_not_retried(self):
+        err = RequestsConnectionError("dns failure")
+        err.__cause__ = socket.gaierror("Name or service not known")
+
+        with patch("backend.app.services.allegro_scraper.requests.get", side_effect=err) as mock_get:
+            with self.assertRaises(RuntimeError) as ctx:
+                scraper._wait_for_candidate_ready("http://selenium:4444/wd/hub", timeout=5)
+
+        self.assertIn("Nie można rozwiązać nazwy hosta", str(ctx.exception))
+        self.assertEqual(mock_get.call_count, 1)
+
+    def test_dns_error_detected_in_reason_chain(self):
+        err = RequestsConnectionError("dns failure")
+        nested = RequestsConnectionError("nested")
+        nested.reason = socket.gaierror("Name or service not known")
+        err.__cause__ = nested
+
+        with patch("backend.app.services.allegro_scraper.requests.get", side_effect=err) as mock_get:
+            with self.assertRaises(RuntimeError):
+                scraper._wait_for_candidate_ready("http://selenium:4444/wd/hub", timeout=5)
+
+        self.assertEqual(mock_get.call_count, 1)
 
 
 if __name__ == "__main__":
