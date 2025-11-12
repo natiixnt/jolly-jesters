@@ -15,13 +15,12 @@ from urllib.parse import urlparse
 import requests
 from requests import Response
 from requests.exceptions import RequestException
-from seleniumwire import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.proxy import Proxy, ProxyType # <--- DODAJ TĘ LINIĘ
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
 
 from ..config import (
     PROXY_PASSWORD,
@@ -174,11 +173,9 @@ def _split_proxy_values() -> List[str]:
 def _build_proxy_extension(
     scheme: str, host: str, port: int, username: str, password: str
 ) -> str:
-    """Tworzy w locie rozszerzenie Chrome z uwierzytelnianiem proxy (Manifest V3)"""
-
-    # ZMIANA: Manifest V3
-    manifest_json = f"""
-    {{
+    """Tworzy w locie rozszerzenie Chrome z uwierzytelnianiem proxy"""
+    manifest_json = """
+    {
         "version": "1.0.0",
         "manifest_version": 3,
         "name": "Chrome Proxy",
@@ -224,7 +221,7 @@ def _build_proxy_extension(
     chrome.webRequest.onAuthRequired.addListener(
                 callbackFn,
                 {{ "urls": ["<all_urls>"] }},
-                ['asyncBlocking']
+                ['blocking', 'asyncBlocking']
     );
     """
 
@@ -256,8 +253,8 @@ def _prepare_proxy(
         extension = _build_proxy_extension(scheme, host, port, username, password)
         capability = {
             "proxyType": "manual",
-            "httpProxy": f"{host}:{port}",
-            "sslProxy": f"{host}:{port}",
+            "httpProxy": f"{username}:{password}@{host}:{port}",
+            "sslProxy": f"{username}:{password}@{host}:{port}",
         }
         return proxy_argument, extension, capability
 
@@ -272,7 +269,6 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         options.add_argument("--headless=new")
     else:
         logger.info("Selenium running in non-headless mode (VNC debugging enabled)")
-
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -285,22 +281,20 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
     if user_agent:
         options.add_argument(f"user-agent={user_agent}")
 
-    # --- LOGIKA PROXY (Metoda z rozszerzeniem V3) ---
     if proxy_url:
-        # _prepare_proxy użyje _build_proxy_extension do stworzenia V3 manifestu
-        proxy_argument, extension, capability = _prepare_proxy(proxy_url)
-
-        if extension:
-            logger.info("Using proxy via encoded extension (with auth).")
-            options.add_encoded_extension(extension)
-        elif proxy_argument:
-            logger.warning("Using proxy via argument (no auth).")
+        proxy_argument, proxy_extension, proxy_capability = _prepare_proxy(proxy_url)
+        if proxy_argument:
             options.add_argument(f"--proxy-server={proxy_argument}")
-    # --- KONIEC ---
+        if proxy_extension:
+            options.add_encoded_extension(proxy_extension)
+        if proxy_capability:
+            options.set_capability("proxy", proxy_capability)
 
-    driver = webdriver.Remote(
+    _wait_for_selenium_ready()
+
+    driver = RemoteWebDriver(
         command_executor=SELENIUM_URL,
-        options=options
+        options=options,
     )
 
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
