@@ -90,7 +90,7 @@ services:
       context: ./backend
     container_name: pilot_scraper_worker
     command: >
-      sh -c "alembic upgrade head && celery -A app.tasks worker --loglevel=info --queues scraper --concurrency=1"
+      sh -c "celery -A app.tasks worker --loglevel=info --queues scraper --concurrency=1"
       - ./backend:/app
       - workspace_data:/workspace
     shm_size: 2g
