@@ -55,6 +55,9 @@ except ImportError:  # pragma: no cover - executed only when selenium is absent
     RemoteWebDriver = _MissingSeleniumProxy()  # type: ignore
 
 from ..config import (
+    PROXY_DIAGNOSTIC_BODY_CHARS,
+    PROXY_DIAGNOSTIC_EXPECT,
+    PROXY_DIAGNOSTIC_URL,
     PROXY_PASSWORD,
     PROXY_URL,
     PROXY_USERNAME,
@@ -239,6 +242,68 @@ def _load_unpatched_remote_webdriver() -> type:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _run_proxy_diagnostics(
+    driver,
+    *,
+    proxy_url: Optional[str],
+    user_agent: Optional[str],
+) -> Optional[dict]:
+    """Odwiedza stronę diagnostyczną, aby zebrać informacje o ruchu przez proxy."""
+
+    if not PROXY_DIAGNOSTIC_URL:
+        return None
+
+    info = {
+        "url": PROXY_DIAGNOSTIC_URL,
+        "proxy": proxy_url,
+        "user_agent": user_agent,
+    }
+
+    try:
+        driver.get(PROXY_DIAGNOSTIC_URL)
+        time.sleep(1)
+
+        title = driver.title
+        current_url = driver.current_url
+        body_preview = driver.execute_script(
+            "return document.body ? document.body.innerText.slice(0, arguments[0]) : '';",
+            PROXY_DIAGNOSTIC_BODY_CHARS,
+        )
+
+        info.update(
+            {
+                "title": title,
+                "current_url": current_url,
+                "body_preview": body_preview,
+            }
+        )
+
+        if PROXY_DIAGNOSTIC_EXPECT:
+            expectation = PROXY_DIAGNOSTIC_EXPECT
+            matched = any(
+                expectation in (value or "")
+                for value in (title, current_url, body_preview)
+            )
+            info["expectation_matched"] = matched
+            if not matched:
+                logger.warning(
+                    "Proxy diagnostic expectation not met. Expected '%s' in diagnostic output.",
+                    expectation,
+                )
+
+        logger.info(
+            "Proxy diagnostic completed via %s (title=%s, snippet=%s)",
+            PROXY_DIAGNOSTIC_URL,
+            title,
+            (body_preview or "")[:80],
+        )
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = str(exc)
+        logger.warning("Proxy diagnostic failed via %s: %s", PROXY_DIAGNOSTIC_URL, exc)
+
+    return info
 
 USER_AGENTS: List[str] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -600,7 +665,9 @@ def _extract_listing_snapshot(driver) -> List[dict]:
         return []
 
 
-def _failure_response(ean: str, error: Optional[Exception]):
+def _failure_response(
+    ean: str, error: Optional[Exception], diagnostics: Optional[dict] = None
+):
     """Buduje odpowiedź dla nieudanej próby wraz z alertem."""
 
     logger.error("Nie udało się pobrać danych Allegro dla EAN %s: %s", ean, error)
@@ -624,6 +691,7 @@ def _failure_response(ean: str, error: Optional[Exception]):
         "not_found": False,
         "error": str(error) if error else None,
         "alert_sent": alert_sent,
+        "diagnostics": diagnostics,
     }
 
 
@@ -642,6 +710,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
         random.shuffle(proxies_cycle)
 
     last_error: Optional[Exception] = None
+    last_diagnostics: Optional[dict] = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         user_agent = agents_pool[(attempt - 1) % len(agents_pool)] if agents_pool else None
@@ -649,9 +718,17 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
         if proxies_cycle:
             proxy_url = proxies_cycle[(attempt - 1) % len(proxies_cycle)]
 
+        diagnostics_info = None
         driver = None
         try:
             driver = get_driver(user_agent=user_agent, proxy_url=proxy_url)
+            diagnostics_info = _run_proxy_diagnostics(
+                driver,
+                proxy_url=proxy_url,
+                user_agent=user_agent,
+            )
+            if diagnostics_info:
+                last_diagnostics = diagnostics_info.copy()
             listing_url = f"https://allegro.pl/listing?string={ean}"
             driver.get(listing_url)
 
@@ -691,6 +768,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "fetched_at": datetime.now(timezone.utc),
                     "not_found": False,
                     "alert_sent": True,
+                    "diagnostics": diagnostics_info or last_diagnostics,
                 }
 
             if _contains_any(page_source, CAPTCHA_KEYWORDS):
@@ -710,6 +788,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "fetched_at": datetime.now(timezone.utc),
                     "not_found": False,
                     "alert_sent": True,
+                    "diagnostics": diagnostics_info or last_diagnostics,
                 }
 
             if _detect_no_results(page_source):
@@ -719,6 +798,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "source": "scrape",
                     "fetched_at": datetime.now(timezone.utc),
                     "not_found": True,
+                    "diagnostics": diagnostics_info or last_diagnostics,
                 }
 
             listing_snapshot = _extract_listing_snapshot(driver)
@@ -734,6 +814,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                                 "source": "selenium_rotating",
                                 "fetched_at": datetime.now(timezone.utc),
                                 "not_found": False,
+                                "diagnostics": diagnostics_info,
                             }
 
             lowest_price = _extract_price(driver, page_source)
@@ -746,6 +827,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "source": "selenium_rotating",
                     "fetched_at": datetime.now(timezone.utc),
                     "not_found": False,
+                    "diagnostics": diagnostics_info,
                 }
             else:
                 last_error = RuntimeError("Price not found in Allegro listing HTML")
@@ -756,7 +838,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
         except SeleniumEndpointUnavailable as exc:
             last_error = exc
             logger.error("Błąd infrastruktury Selenium (attempt %s, EAN %s): %s", attempt, ean, exc)
-            return _failure_response(ean, exc)
+            return _failure_response(ean, exc, diagnostics_info or last_diagnostics)
         except Exception as exc:
             last_error = exc
             logger.exception("Błąd Selenium (attempt %s, EAN %s)", attempt, ean)
@@ -768,4 +850,4 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
         if attempt != MAX_ATTEMPTS:
             time.sleep(BASE_BACKOFF_SECONDS * attempt)
 
-    return _failure_response(ean, last_error)
+    return _failure_response(ean, last_error, last_diagnostics)

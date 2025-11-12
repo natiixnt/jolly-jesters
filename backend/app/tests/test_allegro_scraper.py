@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import socket
@@ -6,6 +7,21 @@ import socket
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
 import backend.app.services.allegro_scraper as scraper
+
+
+class DummyDriver:
+    def __init__(self) -> None:
+        self.page_source = "<html></html>"
+        self.last_url = None
+
+    def get(self, url: str) -> None:
+        self.last_url = url
+
+    def find_elements(self, *args, **kwargs):  # noqa: D401, ANN002, ANN003
+        return [object()]
+
+    def quit(self) -> None:
+        pass
 
 
 class EnsureSeleniumReadyTests(unittest.TestCase):
@@ -85,6 +101,76 @@ class FetchDataRetryTests(unittest.TestCase):
         self.assertEqual(mock_driver.call_count, 1)
         self.assertEqual(result["source"], "failed")
         self.assertIn("dns", result.get("error", ""))
+
+
+class FetchDataDiagnosticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        scraper._ACTIVE_SELENIUM_URL = None
+
+    def tearDown(self) -> None:
+        scraper._ACTIVE_SELENIUM_URL = None
+
+    def _dummy_wait(self, driver):
+        return SimpleNamespace(until=lambda condition: condition(driver))
+
+    def test_success_response_includes_diagnostics(self):
+        diag_payload = {"title": "diag"}
+        driver = DummyDriver()
+
+        with patch.object(scraper, "MAX_ATTEMPTS", 1), patch(
+            "backend.app.services.allegro_scraper.get_driver", return_value=driver
+        ), patch(
+            "backend.app.services.allegro_scraper._run_proxy_diagnostics",
+            return_value=diag_payload,
+        ), patch("backend.app.services.allegro_scraper._accept_cookies"), patch(
+            "backend.app.services.allegro_scraper.WebDriverWait",
+            side_effect=lambda driver, timeout: self._dummy_wait(driver),
+        ), patch(
+            "backend.app.services.allegro_scraper._detect_no_results", return_value=False
+        ), patch(
+            "backend.app.services.allegro_scraper._contains_any", return_value=False
+        ), patch(
+            "backend.app.services.allegro_scraper._extract_listing_snapshot",
+            return_value=[{"price": "123", "sold": "7"}],
+        ), patch(
+            "backend.app.services.allegro_scraper._parse_price", return_value=123.0
+        ), patch(
+            "backend.app.services.allegro_scraper._parse_sold_count", return_value=7
+        ):
+            result = scraper.fetch_allegro_data("1234567890123")
+
+        self.assertEqual(result["diagnostics"], diag_payload)
+        self.assertEqual(result["lowest_price"], 123.0)
+        self.assertEqual(result["sold_count"], 7)
+
+    def test_failure_response_includes_last_diagnostics(self):
+        diag_payload = {"error": "diag_failed"}
+        driver = DummyDriver()
+
+        with patch.object(scraper, "MAX_ATTEMPTS", 1), patch(
+            "backend.app.services.allegro_scraper.get_driver", return_value=driver
+        ), patch(
+            "backend.app.services.allegro_scraper._run_proxy_diagnostics",
+            return_value=diag_payload,
+        ), patch("backend.app.services.allegro_scraper._accept_cookies"), patch(
+            "backend.app.services.allegro_scraper.WebDriverWait",
+            side_effect=lambda driver, timeout: self._dummy_wait(driver),
+        ), patch(
+            "backend.app.services.allegro_scraper._detect_no_results", return_value=False
+        ), patch(
+            "backend.app.services.allegro_scraper._contains_any", return_value=False
+        ), patch(
+            "backend.app.services.allegro_scraper._extract_listing_snapshot",
+            return_value=[],
+        ), patch(
+            "backend.app.services.allegro_scraper._extract_price", return_value=None
+        ), patch(
+            "backend.app.services.allegro_scraper._extract_sold_count", return_value=None
+        ):
+            result = scraper.fetch_allegro_data("9876543210987")
+
+        self.assertEqual(result["source"], "failed")
+        self.assertEqual(result["diagnostics"], diag_payload)
 
 
 if __name__ == "__main__":
