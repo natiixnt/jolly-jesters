@@ -10,7 +10,7 @@ import re
 import sys
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -620,7 +620,7 @@ def _failure_response(ean: str, error: Optional[Exception]):
         "lowest_price": None,
         "sold_count": None,
         "source": "failed",
-        "fetched_at": datetime.utcnow(),
+        "fetched_at": datetime.now(timezone.utc),
         "not_found": False,
         "error": str(error) if error else None,
         "alert_sent": alert_sent,
@@ -688,7 +688,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "lowest_price": None,
                     "sold_count": None,
                     "source": "ban_detected",
-                    "fetched_at": datetime.utcnow(),
+                    "fetched_at": datetime.now(timezone.utc),
                     "not_found": False,
                     "alert_sent": True,
                 }
@@ -707,7 +707,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "lowest_price": None,
                     "sold_count": None,
                     "source": "captcha_detected",
-                    "fetched_at": datetime.utcnow(),
+                    "fetched_at": datetime.now(timezone.utc),
                     "not_found": False,
                     "alert_sent": True,
                 }
@@ -717,7 +717,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "lowest_price": None,
                     "sold_count": None,
                     "source": "scrape",
-                    "fetched_at": datetime.utcnow(),
+                    "fetched_at": datetime.now(timezone.utc),
                     "not_found": True,
                 }
 
@@ -732,7 +732,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                                 "lowest_price": parsed_price,
                                 "sold_count": sold_from_snapshot,
                                 "source": "selenium_rotating",
-                                "fetched_at": datetime.utcnow(),
+                                "fetched_at": datetime.now(timezone.utc),
                                 "not_found": False,
                             }
 
@@ -744,7 +744,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "lowest_price": lowest_price,
                     "sold_count": sold_count,
                     "source": "selenium_rotating",
-                    "fetched_at": datetime.utcnow(),
+                    "fetched_at": datetime.now(timezone.utc),
                     "not_found": False,
                 }
             else:
