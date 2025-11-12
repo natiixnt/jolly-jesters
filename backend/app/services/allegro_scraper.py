@@ -33,30 +33,56 @@ from ..config import (
 from .alerts import send_scraper_alert
 
 SELENIUM_URL = os.getenv("SELENIUM_URL", "http://selenium:4444/wd/hub")
+_SELENIUM_URLS_ENV = os.getenv("SELENIUM_URLS")
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
 SELENIUM_READY_TIMEOUT = int(os.getenv("SELENIUM_READY_TIMEOUT", "30"))
 
 _UNPATCHED_REMOTE_CACHE: Optional[type] = None
+_ACTIVE_SELENIUM_URL: Optional[str] = None
 
 
-def _selenium_status_url() -> str:
+def _candidate_selenium_urls() -> List[str]:
+    """Zwraca uporządkowaną listę kandydatów endpointów Selenium."""
+
+    if _SELENIUM_URLS_ENV:
+        raw_candidates = [u.strip() for u in re.split(r"[;\s,]+", _SELENIUM_URLS_ENV) if u.strip()]
+    else:
+        raw_candidates = [SELENIUM_URL]
+
+        parsed = urlparse(SELENIUM_URL)
+        if parsed.hostname == "selenium":
+            port = f":{parsed.port}" if parsed.port else ""
+            raw_candidates.append(parsed._replace(netloc=f"localhost{port}").geturl())
+            raw_candidates.append(parsed._replace(netloc=f"127.0.0.1{port}").geturl())
+
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for candidate in raw_candidates:
+        if candidate not in seen:
+            ordered.append(candidate)
+            seen.add(candidate)
+    return ordered
+
+
+SELENIUM_URL_CANDIDATES: List[str] = _candidate_selenium_urls()
+
+
+def _selenium_status_url(base_url: str) -> str:
     explicit = os.getenv("SELENIUM_STATUS_URL")
     if explicit:
         return explicit
 
-    base = SELENIUM_URL
+    base = base_url
     if base.endswith("/wd/hub"):
         base = base[: -len("/wd/hub")]
     return f"{base}/status"
 
 
-def _wait_for_selenium_ready(timeout: int = SELENIUM_READY_TIMEOUT) -> None:
-    """Blokuje do momentu aż Selenium Grid zgłosi gotowość lub minie timeout."""
-
-    status_url = _selenium_status_url()
+def _wait_for_candidate_ready(base_url: str, timeout: int) -> None:
     deadline = time.time() + timeout
     last_error: Optional[Exception] = None
+    status_url = _selenium_status_url(base_url)
 
     while time.time() < deadline:
         try:
@@ -70,13 +96,38 @@ def _wait_for_selenium_ready(timeout: int = SELENIUM_READY_TIMEOUT) -> None:
                     return
         except RequestException as exc:
             last_error = exc
-        except ValueError as exc:  # invalid JSON
+        except ValueError as exc:
             last_error = exc
 
         time.sleep(1)
 
     raise RuntimeError(
         f"Selenium status not ready after {timeout}s (last error: {last_error})"
+    )
+
+
+def _ensure_selenium_ready(timeout: int = SELENIUM_READY_TIMEOUT) -> str:
+    global _ACTIVE_SELENIUM_URL
+
+    if _ACTIVE_SELENIUM_URL is not None:
+        return _ACTIVE_SELENIUM_URL
+
+    last_error: Optional[Exception] = None
+
+    for candidate in SELENIUM_URL_CANDIDATES:
+        try:
+            _wait_for_candidate_ready(candidate, timeout)
+            _ACTIVE_SELENIUM_URL = candidate
+            logger.info("Selenium endpoint selected: %s", candidate)
+            return candidate
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("Selenium endpoint %s failed readiness check: %s", candidate, exc)
+
+    raise RuntimeError(
+        "Brak dostępnego endpointu Selenium. Próbowano: "
+        + ", ".join(SELENIUM_URL_CANDIDATES)
+        + (f". Ostatni błąd: {last_error}" if last_error else "")
     )
 
 
@@ -328,12 +379,12 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         if proxy_capability:
             options.set_capability("proxy", proxy_capability)
 
-    _wait_for_selenium_ready()
+    selenium_endpoint = _ensure_selenium_ready()
 
     driver_factory = RemoteWebDriver
     try:
         driver = driver_factory(
-            command_executor=SELENIUM_URL,
+            command_executor=selenium_endpoint,
             options=options,
         )
     except TypeError as exc:
@@ -346,7 +397,7 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
         )
         driver_factory = _load_unpatched_remote_webdriver()
         driver = driver_factory(
-            command_executor=SELENIUM_URL,
+            command_executor=selenium_endpoint,
             options=options,
         )
 
