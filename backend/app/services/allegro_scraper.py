@@ -15,8 +15,11 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+import socket
+
 from requests import Response
-from requests.exceptions import RequestException
+from requests.exceptions import ConnectionError as RequestsConnectionError, RequestException
+from urllib3.exceptions import NameResolutionError
 
 try:
     from selenium.common.exceptions import TimeoutException
@@ -121,6 +124,23 @@ def _wait_for_candidate_ready(base_url: str, timeout: int) -> None:
                     return
         except RequestException as exc:
             last_error = exc
+            cause = getattr(exc, "__cause__", None)
+
+            if isinstance(exc, RequestsConnectionError):
+                # Name resolution errors do not benefit from additional retries and
+                # we can immediately fall back to another Selenium candidate.
+                fatal = isinstance(cause, NameResolutionError) or isinstance(
+                    getattr(cause, "__cause__", None), socket.gaierror
+                )
+                if not fatal and isinstance(cause, RequestsConnectionError):
+                    fatal = isinstance(
+                        getattr(cause, "__cause__", None), socket.gaierror
+                    )
+
+                if fatal:
+                    raise RuntimeError(
+                        f"Nie można rozwiązać nazwy hosta dla {status_url}: {cause}"
+                    ) from exc
         except ValueError as exc:
             last_error = exc
 
