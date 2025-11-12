@@ -598,6 +598,33 @@ def _extract_listing_snapshot(driver) -> List[dict]:
         return []
 
 
+def _failure_response(ean: str, error: Optional[Exception]):
+    """Buduje odpowiedź dla nieudanej próby wraz z alertem."""
+
+    logger.error("Nie udało się pobrać danych Allegro dla EAN %s: %s", ean, error)
+
+    alert_sent = False
+    if error:
+        send_scraper_alert(
+            "allegro_scrape_failed",
+            {
+                "ean": ean,
+                "error": str(error),
+            },
+        )
+        alert_sent = True
+
+    return {
+        "lowest_price": None,
+        "sold_count": None,
+        "source": "failed",
+        "fetched_at": datetime.utcnow(),
+        "not_found": False,
+        "error": str(error) if error else None,
+        "alert_sent": alert_sent,
+    }
+
+
 def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] = None):
     """Scraper Allegro z rotacją proxy/UA, retry i detekcją banów"""
 
@@ -727,7 +754,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
         except SeleniumEndpointUnavailable as exc:
             last_error = exc
             logger.error("Błąd infrastruktury Selenium (attempt %s, EAN %s): %s", attempt, ean, exc)
-            break
+            return _failure_response(ean, exc)
         except Exception as exc:
             last_error = exc
             logger.exception("Błąd Selenium (attempt %s, EAN %s)", attempt, ean)
@@ -739,21 +766,4 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
         if attempt != MAX_ATTEMPTS:
             time.sleep(BASE_BACKOFF_SECONDS * attempt)
 
-    logger.error("Nie udało się pobrać danych Allegro dla EAN %s: %s", ean, last_error)
-    if last_error:
-        send_scraper_alert(
-            "allegro_scrape_failed",
-            {
-                "ean": ean,
-                "error": str(last_error),
-            },
-        )
-    return {
-        "lowest_price": None,
-        "sold_count": None,
-        "source": "failed",
-        "fetched_at": datetime.utcnow(),
-        "not_found": False,
-        "error": str(last_error) if last_error else None,
-        "alert_sent": bool(last_error),
-    }
+    return _failure_response(ean, last_error)
