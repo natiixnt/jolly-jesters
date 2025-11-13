@@ -47,6 +47,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    dns: # <--- DODAJ TĘ LINIĘ
+      - 8.8.8.8 # <--- I TĘ LINIĘ
   # --- KONIEC DODANEJ USŁUGI ---
 
   backend:
