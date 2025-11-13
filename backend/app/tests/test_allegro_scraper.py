@@ -207,6 +207,49 @@ class FetchDataDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["source"], "failed")
         self.assertIn("Proxy diagnostic expectation not met", result.get("error", ""))
 
+    def test_forbidden_diagnostic_aborts_immediately(self):
+        diag_payload = {
+            "forbidden_matches": [
+                {"token": "forbidden", "field": "title", "value": "forbidden"}
+            ]
+        }
+        driver = DummyDriver()
+
+        with patch.object(scraper, "MAX_ATTEMPTS", 3), patch(
+            "backend.app.services.allegro_scraper.get_driver", return_value=driver
+        ) as mock_driver, patch(
+            "backend.app.services.allegro_scraper._run_proxy_diagnostics",
+            return_value=diag_payload,
+        ), patch(
+            "backend.app.services.allegro_scraper.send_scraper_alert"
+        ) as mock_alert:
+            result = scraper.fetch_allegro_data("4444444444444")
+
+        self.assertEqual(mock_driver.call_count, 1)
+        mock_alert.assert_called_once()
+        self.assertEqual(result["source"], "failed")
+        self.assertEqual(result["diagnostics"], diag_payload)
+        self.assertIn("forbidden", (result.get("error") or "").lower())
+
+
+class PrepareProxyTests(unittest.TestCase):
+    def test_prepare_proxy_omits_credentials_from_capabilities(self):
+        proxy_url = "http://user:pass@proxy.example:8080"
+
+        with patch(
+            "backend.app.services.allegro_scraper.PROXY_USERNAME", new=None
+        ), patch("backend.app.services.allegro_scraper.PROXY_PASSWORD", new=None):
+            proxy_argument, extension, capability = scraper._prepare_proxy(proxy_url)
+
+        self.assertEqual(proxy_argument, "http://proxy.example:8080")
+        self.assertIsNotNone(extension)
+        self.assertIsNotNone(capability)
+        self.assertEqual(capability.get("httpProxy"), "proxy.example:8080")
+        self.assertEqual(capability.get("sslProxy"), "proxy.example:8080")
+        # Credentials should only live inside the encoded extension.
+        self.assertNotIn("user", capability.get("httpProxy"))
+        self.assertNotIn("pass", capability.get("httpProxy"))
+
 
 if __name__ == "__main__":
     unittest.main()
