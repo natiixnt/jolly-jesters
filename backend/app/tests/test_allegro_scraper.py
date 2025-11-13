@@ -172,6 +172,41 @@ class FetchDataDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["source"], "failed")
         self.assertEqual(result["diagnostics"], diag_payload)
 
+    def test_diagnostic_expectation_mismatch_triggers_retry_failure(self):
+        diag_payload = {"title": "wrong", "expectation_matched": False}
+        driver = DummyDriver()
+
+        with patch.object(scraper, "MAX_ATTEMPTS", 1), patch(
+            "backend.app.services.allegro_scraper.get_driver", return_value=driver
+        ), patch(
+            "backend.app.services.allegro_scraper._run_proxy_diagnostics",
+            return_value=diag_payload,
+        ), patch("backend.app.services.allegro_scraper._accept_cookies"), patch(
+            "backend.app.services.allegro_scraper.WebDriverWait",
+            side_effect=lambda driver, timeout: self._dummy_wait(driver),
+        ), patch(
+            "backend.app.services.allegro_scraper._detect_no_results", return_value=False
+        ), patch(
+            "backend.app.services.allegro_scraper._contains_any", return_value=False
+        ), patch(
+            "backend.app.services.allegro_scraper._extract_listing_snapshot",
+            return_value=[],
+        ), patch(
+            "backend.app.services.allegro_scraper._extract_price", return_value=None
+        ), patch(
+            "backend.app.services.allegro_scraper._extract_sold_count", return_value=None
+        ), patch(
+            "backend.app.services.allegro_scraper.PROXY_DIAGNOSTIC_EXPECT",
+            new="EXPECTED",
+        ), patch(
+            "backend.app.services.allegro_scraper.PROXY_DIAGNOSTIC_URL",
+            new="https://diagnostic.local",
+        ):
+            result = scraper.fetch_allegro_data("5555555555555")
+
+        self.assertEqual(result["source"], "failed")
+        self.assertIn("Proxy diagnostic expectation not met", result.get("error", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

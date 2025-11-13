@@ -28,7 +28,6 @@ try:
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
-    from selenium.webdriver.common.proxy import Proxy, ProxyType  # <-- DODAJ TĘ LINIĘ
 except ImportError:  # pragma: no cover - executed only when selenium is absent
     class TimeoutException(Exception):  # type: ignore
         """Minimal substytut TimeoutException gdy Selenium nie jest dostępne."""
@@ -54,7 +53,6 @@ except ImportError:  # pragma: no cover - executed only when selenium is absent
     EC = _MissingSeleniumProxy()  # type: ignore
     WebDriverWait = _MissingSeleniumProxy()  # type: ignore
     RemoteWebDriver = _MissingSeleniumProxy()  # type: ignore
-
 
 from ..config import (
     PROXY_DIAGNOSTIC_BODY_CHARS,
@@ -282,6 +280,11 @@ def _run_proxy_diagnostics(
             }
         )
 
+        if body_preview:
+            ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", body_preview)
+            if ip_match:
+                info["detected_ip"] = ip_match.group(0)
+
         if PROXY_DIAGNOSTIC_EXPECT:
             expectation = PROXY_DIAGNOSTIC_EXPECT
             matched = any(
@@ -463,12 +466,10 @@ def _build_proxy_extension(
     return base64.b64encode(zip_buffer.getvalue()).decode("utf-8")
 
 
-# Plik: backend/app/services/allegro_scraper.py
-
 def _prepare_proxy(
     proxy_url: str,
 ) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, str]]]:
-    """Zwraca argument proxy dla trybu IP Whitelisting."""
+    """Zwraca argument proxy, rozszerzenie oraz dodatkowe capability"""
     parsed = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
     host = parsed.hostname
     port = parsed.port
@@ -478,24 +479,20 @@ def _prepare_proxy(
     scheme = parsed.scheme or "http"
     proxy_argument = f"{scheme}://{host}:{port}"
 
-    # Zakładamy tryb IP Whitelist (brak loginu/hasła)
-    logger.info(f"Preparing proxy capability for IP Whitelisting: {host}:{port}")
-    capability = {
-        "proxyType": "manual",
-        "httpProxy": f"{host}:{port}",
-        "sslProxy": f"{host}:{port}",
-    }
-    
-    return proxy_argument, None, capability
+    username = parsed.username or PROXY_USERNAME
+    password = parsed.password or PROXY_PASSWORD
 
+    if username and password:
+        extension = _build_proxy_extension(scheme, host, port, username, password)
+        capability = {
+            "proxyType": "manual",
+            "httpProxy": f"{username}:{password}@{host}:{port}",
+            "sslProxy": f"{username}:{password}@{host}:{port}",
+        }
+        return proxy_argument, extension, capability
 
-# Plik: backend/app/services/allegro_scraper.py
+    return proxy_argument, None, None
 
-# Skopiuj i wklej ten kod, zastępując całą funkcję get_driver
-
-# Skopiuj i wklej ten kod, zastępując całą funkcję get_driver
-
-# Skopiuj i wklej ten kod, zastępując całą funkcję get_driver
 
 def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None):
     """Tworzy instancję zdalnej przeglądarki Chrome w kontenerze Selenium"""
@@ -517,54 +514,35 @@ def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None
     if user_agent:
         options.add_argument(f"user-agent={user_agent}")
 
-    # --- NOWA, RĘCZNA LOGIKA PROXY ---
     if proxy_url:
-        # Bierzemy tylko adres (np. http://eu.smartproxy.net:3120)
-        proxy_argument, _, _ = _prepare_proxy(proxy_url) 
-
+        proxy_argument, proxy_extension, proxy_capability = _prepare_proxy(proxy_url)
         if proxy_argument:
-            proxy_address = proxy_argument.split("://")[-1] # -> 'eu.smartproxy.net:3120'
-            
-            logger.info(f"Manually setting proxy capability: {proxy_address}")
-
-            # 1. Ręcznie zbuduj słownik capability (zgodny z W3C)
-            proxy_caps = {
-                "proxyType": "MANUAL",
-                "httpProxy": proxy_address,
-                "sslProxy": proxy_address,
-                "noProxy": ["localhost", "127.0.0.1"] # Dobre praktyki
-            }
-            
-            # 2. Ustaw capability
-            options.set_capability("proxy", proxy_caps)
-            
-            # 3. Ustaw argument dla Chrome (redundantne, ale nie szkodzi)
             options.add_argument(f"--proxy-server={proxy_argument}")
-            logger.info(f"Set proxy via argument: {proxy_argument}")
-    # --- KONIEC NOWEJ LOGIKI PROXY ---
+        if proxy_extension:
+            options.add_encoded_extension(proxy_extension)
+        if proxy_capability:
+            options.set_capability("proxy", proxy_capability)
 
     selenium_endpoint = _ensure_selenium_ready()
 
     driver_factory = RemoteWebDriver
     try:
-        # Używamy już tylko 'options', bez 'desired_capabilities'
         driver = driver_factory(
             command_executor=selenium_endpoint,
-            options=options
+            options=options,
         )
     except TypeError as exc:
-        if "desired_capabilities" in str(exc):
-             logger.error("Błąd 'desired_capabilities' wciąż występuje mimo poprawki!")
-        
+        if "desired_capabilities" not in str(exc):
+            raise
+
         logger.warning(
-            "RemoteWebDriver zgłosił TypeError, próbuję ponownie z klasą bez patchy: %s",
+            "RemoteWebDriver zgłosił TypeError dotyczący desired_capabilities, próbuję ponownie z klasą bez patchy: %s",
             exc,
         )
         driver_factory = _load_unpatched_remote_webdriver()
-        
         driver = driver_factory(
             command_executor=selenium_endpoint,
-            options=options
+            options=options,
         )
 
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -722,12 +700,11 @@ def _failure_response(
     }
 
 
-# Skopiuj i wklej ten kod, zastępując całą funkcję fetch_allegro_data
-
 def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] = None):
     """Scraper Allegro z rotacją proxy/UA, retry i detekcją banów"""
 
     if use_api and api_key:
+        # API jest opcjonalne – aktualnie pomijamy, bo nie zwraca wymaganych danych
         pass
 
     proxies = _split_proxy_values()
@@ -740,48 +717,16 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
     last_error: Optional[Exception] = None
     last_diagnostics: Optional[dict] = None
 
-    # Pobierz bazową nazwę użytkownika (bez żadnych starych sesji)
-    username_base = (PROXY_USERNAME or "").split("-session-")[0]
-
     for attempt in range(1, MAX_ATTEMPTS + 1):
         user_agent = agents_pool[(attempt - 1) % len(agents_pool)] if agents_pool else None
-        
         proxy_url = None
         if proxies_cycle:
-            base_proxy_url = proxies_cycle[(attempt - 1) % len(proxies_cycle)] # np. http://eu.smartproxy.net:3120
-            
-            # --- LOGIKA ROTACJI (dla IP Whitelist) ---
-            # Wymuszamy nowy IP dla każdej próby, dodając losowe ID sesji do nazwy użytkownika.
-            # Działa tylko, jeśli mamy bazowy username i puste hasło.
-            if "smartproxy" in base_proxy_url and username_base and not PROXY_PASSWORD:
-                try:
-                    parsed_url = urlparse(base_proxy_url)
-                    
-                    # Generuj unikalne ID dla tej próby
-                    session_id = f"session-att{attempt}_{random.randint(10000, 99999)}"
-                    new_username = f"{username_base}-{session_id}"
-                    
-                    # Zbuduj nowy URL proxy z nową nazwą użytkownika, ale BEZ HASŁA
-                    # Wygląda tak: http://smart-user-session-12345@eu.smartproxy.net:3120
-                    new_netloc = f"{new_username}@{parsed_url.hostname}:{parsed_url.port}"
-                    proxy_url = parsed_url._replace(netloc=new_netloc).geturl()
-                    
-                    logger.info(f"Attempt {attempt}/{MAX_ATTEMPTS} (EAN: {ean}) - Using Smartproxy rotating session: {new_username}")
-                except Exception as e:
-                    logger.warning(f"Could not build rotating proxy URL: {e}")
-                    proxy_url = base_proxy_url # Fallback
-            else:
-                # Jeśli to nie smartproxy lub mamy hasło, użyj standardowo
-                proxy_url = base_proxy_url
-            # --- KONIEC LOGIKI ROTACJI ---
+            proxy_url = proxies_cycle[(attempt - 1) % len(proxies_cycle)]
 
         diagnostics_info = None
         driver = None
         try:
-            # get_driver przekaże URL (z rotującym username) do _prepare_proxy,
-            # a _prepare_proxy zbuduje poprawne "capability" dla Selenium.
             driver = get_driver(user_agent=user_agent, proxy_url=proxy_url)
-            
             diagnostics_info = _run_proxy_diagnostics(
                 driver,
                 proxy_url=proxy_url,
@@ -790,18 +735,38 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             if diagnostics_info:
                 last_diagnostics = diagnostics_info.copy()
 
-            # --- STRATEGIA: ROZGRZEWKA ---
-            logger.info(f"Attempt {attempt}/{MAX_ATTEMPTS} (EAN: {ean}) - Warming up session on allegro.pl homepage...")
-            driver.get("https://allegro.pl/")
-            time.sleep(random.uniform(1.0, 2.0))
-            _accept_cookies(driver)
-            time.sleep(random.uniform(0.5, 1.5)) 
+                if diagnostics_info.get("error"):
+                    last_error = RuntimeError(
+                        f"Proxy diagnostic failed: {diagnostics_info['error']}"
+                    )
+                    logger.warning(
+                        "Proxy diagnostic returned an error (attempt %s, EAN %s): %s",
+                        attempt,
+                        ean,
+                        diagnostics_info["error"],
+                    )
+                    continue
 
-            logger.info(f"Attempt {attempt}/{MAX_ATTEMPTS} (EAN: {ean}) - Navigating to listing page...")
+                if (
+                    PROXY_DIAGNOSTIC_EXPECT
+                    and not diagnostics_info.get("expectation_matched", False)
+                ):
+                    last_error = RuntimeError(
+                        "Proxy diagnostic expectation not met"
+                    )
+                    logger.warning(
+                        "Proxy diagnostic expectation not met (attempt %s, EAN %s)."
+                        " Expecting '%s' in diagnostic output.",
+                        attempt,
+                        ean,
+                        PROXY_DIAGNOSTIC_EXPECT,
+                    )
+                    continue
             listing_url = f"https://allegro.pl/listing?string={ean}"
             driver.get(listing_url)
+
             _accept_cookies(driver)
-            
+
             try:
                 WebDriverWait(driver, 15).until(
                     lambda d: (
@@ -812,16 +777,11 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             except TimeoutException as exc:
                 last_error = exc
                 logger.warning("Timeout oczekiwania na listing (attempt %s, EAN %s)", attempt, ean)
-                continue 
+                continue
 
-            # --- SYMULACJA UŻYTKOWNIKA ---
-            time.sleep(random.uniform(1.2, 2.5)) 
-            try:
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 3);")
-            except Exception:
-                pass 
-            time.sleep(random.uniform(1.5, 3.0))
-            
+            # dodatkowy, krótki czas na pełne wczytanie komponentów cenowych
+            time.sleep(1 + random.uniform(0.2, 0.8))
+
             page_source = driver.page_source
 
             if _contains_any(page_source, BAN_KEYWORDS):
@@ -919,6 +879,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             if driver:
                 driver.quit()
 
+        # backoff przed kolejną próbą
         if attempt != MAX_ATTEMPTS:
             time.sleep(BASE_BACKOFF_SECONDS * attempt)
 
