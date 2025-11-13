@@ -37,6 +37,14 @@ PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 PROXY_DIAGNOSTIC_URL = os.getenv("PROXY_DIAGNOSTIC_URL")
 PROXY_DIAGNOSTIC_EXPECT = os.getenv("PROXY_DIAGNOSTIC_EXPECT")
 PROXY_DIAGNOSTIC_BODY_CHARS = int(os.getenv("PROXY_DIAGNOSTIC_BODY_CHARS", "200"))
+PROXY_DIAGNOSTIC_FORBID = tuple(
+    token
+    for token in (
+        value.strip()
+        for value in (os.getenv("PROXY_DIAGNOSTIC_FORBID") or "").replace(";", ",").split(",")
+    )
+    if token
+)
 SCRAPER_ALERT_WEBHOOK = os.getenv("SCRAPER_ALERT_WEBHOOK")
 
 

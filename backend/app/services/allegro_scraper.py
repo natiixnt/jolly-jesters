@@ -57,6 +57,7 @@ except ImportError:  # pragma: no cover - executed only when selenium is absent
 from ..config import (
     PROXY_DIAGNOSTIC_BODY_CHARS,
     PROXY_DIAGNOSTIC_EXPECT,
+    PROXY_DIAGNOSTIC_FORBID,
     PROXY_DIAGNOSTIC_URL,
     PROXY_PASSWORD,
     PROXY_URL,
@@ -261,6 +262,8 @@ def _run_proxy_diagnostics(
         "user_agent": user_agent,
     }
 
+    forbidden_hits: List[dict] = []
+
     try:
         driver.get(PROXY_DIAGNOSTIC_URL)
         time.sleep(1)
@@ -296,6 +299,34 @@ def _run_proxy_diagnostics(
                 logger.warning(
                     "Proxy diagnostic expectation not met. Expected '%s' in diagnostic output.",
                     expectation,
+                )
+
+        if PROXY_DIAGNOSTIC_FORBID:
+            scan_targets = [
+                ("title", title or ""),
+                ("current_url", current_url or ""),
+                ("body_preview", body_preview or ""),
+                ("detected_ip", info.get("detected_ip", "")),
+            ]
+
+            lowered_targets = [
+                (field, value, value.lower())
+                for field, value in scan_targets
+                if value
+            ]
+
+            for token in PROXY_DIAGNOSTIC_FORBID:
+                token_lower = token.lower()
+                for field, original, lower_value in lowered_targets:
+                    if token_lower in lower_value:
+                        forbidden_hits.append({"token": token, "field": field, "value": original})
+
+            if forbidden_hits:
+                info["forbidden_matches"] = forbidden_hits
+                logger.warning(
+                    "Proxy diagnostic detected forbidden markers %s (proxy=%s)",
+                    ", ".join(match["token"] for match in forbidden_hits),
+                    proxy_url or "<brak>",
                 )
 
         logger.info(
@@ -482,16 +513,17 @@ def _prepare_proxy(
     username = parsed.username or PROXY_USERNAME
     password = parsed.password or PROXY_PASSWORD
 
+    capability = {
+        "proxyType": "manual",
+        "httpProxy": f"{host}:{port}",
+        "sslProxy": f"{host}:{port}",
+    }
+
+    extension = None
     if username and password:
         extension = _build_proxy_extension(scheme, host, port, username, password)
-        capability = {
-            "proxyType": "manual",
-            "httpProxy": f"{username}:{password}@{host}:{port}",
-            "sslProxy": f"{username}:{password}@{host}:{port}",
-        }
-        return proxy_argument, extension, capability
 
-    return proxy_argument, None, None
+    return proxy_argument, extension, capability
 
 
 def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None):
@@ -762,6 +794,29 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                         PROXY_DIAGNOSTIC_EXPECT,
                     )
                     continue
+
+                forbidden_matches = diagnostics_info.get("forbidden_matches") or []
+                if forbidden_matches:
+                    tokens = ", ".join(
+                        match.get("token") or str(match.get("value"))
+                        for match in forbidden_matches
+                        if match
+                    )
+                    error_message = (
+                        "Proxy diagnostic detected forbidden markers"
+                        + (f": {tokens}" if tokens else "")
+                    )
+                    logger.warning(
+                        "Proxy diagnostic detected forbidden markers (attempt %s, EAN %s): %s",
+                        attempt,
+                        ean,
+                        tokens or "<unknown>",
+                    )
+                    return _failure_response(
+                        ean,
+                        RuntimeError(error_message),
+                        diagnostics_info,
+                    )
             listing_url = f"https://allegro.pl/listing?string={ean}"
             driver.get(listing_url)
 
