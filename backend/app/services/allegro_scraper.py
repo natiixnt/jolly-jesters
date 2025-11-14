@@ -45,7 +45,17 @@ except ImportError:  # pragma: no cover - executed only when selenium is absent
         def __call__(self, *args, **kwargs):  # noqa: D401 - behaviour documented in _MESSAGE
             raise RuntimeError(self._MESSAGE)
 
+        _SAFE_ATTRS = {
+            "__wrapped__",
+            "__func__",
+            "__self__",
+            "__module__",
+            "__doc__",
+        }
+
         def __getattr__(self, item):
+            if item in self._SAFE_ATTRS:
+                return None
             raise RuntimeError(self._MESSAGE)
 
     ChromeOptions = _MissingSeleniumProxy()  # type: ignore
@@ -939,5 +949,3 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             time.sleep(BASE_BACKOFF_SECONDS * attempt)
 
     return _failure_response(ean, last_error, last_diagnostics)
-
-
