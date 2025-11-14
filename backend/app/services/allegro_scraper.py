@@ -939,3 +939,5 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
             time.sleep(BASE_BACKOFF_SECONDS * attempt)
 
     return _failure_response(ean, last_error, last_diagnostics)
+
+
