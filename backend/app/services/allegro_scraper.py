@@ -912,7 +912,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                                 "source": "selenium_rotating",
                                 "fetched_at": datetime.now(timezone.utc),
                                 "not_found": False,
-                                "diagnostics": diagnostics_info,
+                                "diagnostics": diagnostics_info or last_diagnostics,
                             }
 
             lowest_price = _extract_price(driver, page_source)
@@ -925,7 +925,7 @@ def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] =
                     "source": "selenium_rotating",
                     "fetched_at": datetime.now(timezone.utc),
                     "not_found": False,
-                    "diagnostics": diagnostics_info,
+                    "diagnostics": diagnostics_info or last_diagnostics,
                 }
             else:
                 last_error = RuntimeError("Price not found in Allegro listing HTML")
