@@ -157,26 +157,24 @@ def fetch_allegro_data(ean: str, **kwargs) -> Dict[str, object]:
     proxies = _build_proxy_url()
     url = LISTING_URL_TEMPLATE.format(query=quote_plus(ean))
 
-    # --- POPRAWKA: Ustawiamy agresywny timeout dla connect i read ---
-    # Czekaj max 10s na połączenie, max 20s na odczyt.
+    # Ustawiamy agresywny timeout dla connect i read
     timeout_config = Timeout(20.0, connect=10.0)
 
     try:
         with Client(
             proxies=proxies,
             impersonate="chrome120",
-            timeout=timeout_config, # <-- Zastosowanie nowej konfiguracji
+            timeout=timeout_config, 
             follow_redirects=True,
+            http2=False, # <-- KLUCZOWA POPRAWKA: Wyłącz HTTP/2
         ) as client:
             response = client.get(url, headers=DEFAULT_HEADERS)
     
-    # --- POPRAWKA: Łapiemy wszystkie błędy, w tym TimeoutException ---
-    except Exception as exc:  # pragma: no cover - ochrona przed nieoczekiwanymi wyjątkami
+    except Exception as exc: 
         logger.error("Błąd krytyczny httpx (w tym Timeout) dla EAN %s: %s", ean, exc)
         return _base_result(
             source="failed",
             fetched_at=fetched_at,
-            # Zwracamy błąd, aby worker mógł go odnotować
             error=f"Timeout lub błąd połączenia: {exc}", 
         )
 
@@ -209,7 +207,6 @@ def fetch_allegro_data(ean: str, **kwargs) -> Dict[str, object]:
             not_found=True,
         )
 
-    # --- POPRAWKA: Łapiemy inne błędy HTTP ---
     if response.status_code >= 400:
         logger.error("Nieobsłużony błąd HTTP %s dla EAN %s", response.status_code, ean)
         return _base_result(
