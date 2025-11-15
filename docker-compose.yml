@@ -32,25 +32,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- DODANA USŁUGA SELENIUM ---
-  selenium:
-    image: selenium/standalone-chrome:latest # Używamy obrazu standalone dla prostoty
-    container_name: pilot_selenium
-    restart: unless-stopped
-    shm_size: 2g # Ważne dla stabilności Chrome w Dockerze
-    ports:
-      - "4444:4444" # Port Selenium Grid
-      - "7900:7900" # Port VNC (do podglądu, wpisz w przeglądarce http://localhost:7900)
-    healthcheck:
-      # Sprawdza, czy hub Selenium jest gotowy
-      test: ["CMD", "curl", "-f", "http://localhost:4444/wd/hub/status"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    dns: # <--- DODAJ TĘ LINIĘ
-      - 8.8.8.8 # <--- I TĘ LINIĘ
-  # --- KONIEC DODANEJ USŁUGI ---
-
   backend:
     build:
       context: ./backend
@@ -93,6 +74,7 @@ services:
     container_name: pilot_scraper_worker
     command: >
       sh -c "celery -A app.tasks worker --loglevel=info --queues scraper --concurrency=1"
+    volumes:
       - ./backend:/app
       - workspace_data:/workspace
     shm_size: 2g
@@ -100,14 +82,13 @@ services:
       - WORKSPACE=/workspace
       - CELERY_BROKER_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql+psycopg2://pilot:pilot@postgres:5432/pilotdb
-      - SELENIUM_URL=http://selenium:4444/wd/hub
       - SELENIUM_HEADLESS=${SELENIUM_HEADLESS:-0}
+    dns:
+      - 8.8.8.8
     depends_on:
       postgres: # <-- POPRAWKA: Dodano warunek 'service_healthy'
         condition: service_healthy
       redis: # <-- POPRAWKA: Dodano warunek 'service_healthy'
-        condition: service_healthy
-      selenium: # <-- POPRAWKA: Dodano brakującą zależność od Selenium
         condition: service_healthy
 
   frontend:
