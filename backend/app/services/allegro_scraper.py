@@ -1,951 +1,228 @@
-# Plik: backend/app/services/allegro_scraper.py
+"""Scraper Allegro wykorzystujący httpx_impersonate do maskowania fingerprintu TLS."""
 
-import base64
-import importlib.util
-import io
+from __future__ import annotations
+
 import logging
-import os
-import random
 import re
-import sys
-import time
-import zipfile
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Dict, Optional
+from urllib.parse import quote, quote_plus, urlparse, urlunparse
 
-import requests
-import socket
+from httpx import HTTPError
+from httpx_impersonate import Client
 
-from requests import Response
-from requests.exceptions import ConnectionError as RequestsConnectionError, RequestException
-from urllib3.exceptions import NameResolutionError
-
-try:
-    from selenium.common.exceptions import TimeoutException
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
-except ImportError:  # pragma: no cover - executed only when selenium is absent
-    class TimeoutException(Exception):  # type: ignore
-        """Minimal substytut TimeoutException gdy Selenium nie jest dostępne."""
-
-
-    class _MissingSeleniumProxy:
-        """Fallback callable that raises a helpful error when Selenium is required."""
-
-        _MESSAGE = (
-            "Selenium package is required to run the Allegro scraper. "
-            "Install selenium or execute this code in the runtime environment "
-            "that provides it."
-        )
-
-        def __call__(self, *args, **kwargs):  # noqa: D401 - behaviour documented in _MESSAGE
-            raise RuntimeError(self._MESSAGE)
-
-        _SAFE_ATTRS = {
-            "__wrapped__",
-            "__func__",
-            "__self__",
-            "__module__",
-            "__doc__",
-        }
-
-        def __getattr__(self, item):
-            if item in self._SAFE_ATTRS:
-                return None
-            raise RuntimeError(self._MESSAGE)
-
-    ChromeOptions = _MissingSeleniumProxy()  # type: ignore
-    By = _MissingSeleniumProxy()  # type: ignore
-    EC = _MissingSeleniumProxy()  # type: ignore
-    WebDriverWait = _MissingSeleniumProxy()  # type: ignore
-    RemoteWebDriver = _MissingSeleniumProxy()  # type: ignore
-
-from ..config import (
-    PROXY_DIAGNOSTIC_BODY_CHARS,
-    PROXY_DIAGNOSTIC_EXPECT,
-    PROXY_DIAGNOSTIC_FORBID,
-    PROXY_DIAGNOSTIC_URL,
-    PROXY_PASSWORD,
-    PROXY_URL,
-    PROXY_USERNAME,
-    SELENIUM_HEADLESS,
-)
+from ..config import PROXY_PASSWORD, PROXY_URL, PROXY_USERNAME
 from .alerts import send_scraper_alert
-
-SELENIUM_URL = os.getenv("SELENIUM_URL", "http://selenium:4444/wd/hub")
-_SELENIUM_URLS_ENV = os.getenv("SELENIUM_URLS")
-MAX_ATTEMPTS = 3
-BASE_BACKOFF_SECONDS = 2
-SELENIUM_READY_TIMEOUT = int(os.getenv("SELENIUM_READY_TIMEOUT", "30"))
-
-class SeleniumEndpointUnavailable(RuntimeError):
-    """Sygnałizuje brak dostępnego endpointu Selenium."""
-
-
-_UNPATCHED_REMOTE_CACHE: Optional[type] = None
-_ACTIVE_SELENIUM_URL: Optional[str] = None
-
-
-def _candidate_selenium_urls() -> List[str]:
-    """Zwraca uporządkowaną listę kandydatów endpointów Selenium."""
-
-    if _SELENIUM_URLS_ENV:
-        raw_candidates = [u.strip() for u in re.split(r"[;\s,]+", _SELENIUM_URLS_ENV) if u.strip()]
-    else:
-        raw_candidates = [SELENIUM_URL]
-
-        parsed = urlparse(SELENIUM_URL)
-        if parsed.hostname == "selenium":
-            port = f":{parsed.port}" if parsed.port else ""
-            raw_candidates.append(parsed._replace(netloc=f"localhost{port}").geturl())
-            raw_candidates.append(parsed._replace(netloc=f"127.0.0.1{port}").geturl())
-
-    seen: set[str] = set()
-    ordered: List[str] = []
-    for candidate in raw_candidates:
-        if candidate not in seen:
-            ordered.append(candidate)
-            seen.add(candidate)
-    return ordered
-
-
-SELENIUM_URL_CANDIDATES: List[str] = _candidate_selenium_urls()
-
-
-def _selenium_status_url(base_url: str) -> str:
-    explicit = os.getenv("SELENIUM_STATUS_URL")
-    if explicit:
-        return explicit
-
-    base = base_url
-    if base.endswith("/wd/hub"):
-        base = base[: -len("/wd/hub")]
-    return f"{base}/status"
-
-
-def _iter_causes(exc: Exception):
-    """Yields an exception and its chained causes/contexts without cycling."""
-
-    seen = set()
-    queue = [exc]
-
-    while queue:
-        current = queue.pop(0)
-        if current is None or id(current) in seen:
-            continue
-
-        yield current
-        seen.add(id(current))
-        queue.append(getattr(current, "__cause__", None))
-        queue.append(getattr(current, "__context__", None))
-
-
-def _find_dns_error(exc: Exception) -> Optional[BaseException]:
-    """Returns the first DNS-related cause in the exception chain, if any."""
-
-    for cause in _iter_causes(exc):
-        if isinstance(cause, (NameResolutionError, socket.gaierror)):
-            return cause
-
-        reason = getattr(cause, "reason", None)
-        if isinstance(reason, (NameResolutionError, socket.gaierror)):
-            return reason
-    return None
-
-
-def _wait_for_candidate_ready(base_url: str, timeout: int) -> None:
-    deadline = time.time() + timeout
-    last_error: Optional[Exception] = None
-    status_url = _selenium_status_url(base_url)
-
-    while time.time() < deadline:
-        try:
-            response: Response = requests.get(status_url, timeout=3)
-            if response.status_code == 200:
-                payload = response.json()
-                ready = payload.get("value", {}).get("ready")
-                if ready is None:
-                    ready = payload.get("ready")
-                if ready:
-                    return
-        except RequestException as exc:
-            last_error = exc
-
-            if isinstance(exc, RequestsConnectionError):
-                dns_error = _find_dns_error(exc)
-                if dns_error is not None:
-                    raise SeleniumEndpointUnavailable(
-                        f"Nie można rozwiązać nazwy hosta dla {status_url}: {dns_error}"
-                    ) from exc
-        except ValueError as exc:
-            last_error = exc
-
-        time.sleep(1)
-
-    raise SeleniumEndpointUnavailable(
-        f"Selenium status not ready after {timeout}s (last error: {last_error})"
-    )
-
-
-def _ensure_selenium_ready(timeout: int = SELENIUM_READY_TIMEOUT) -> str:
-    global _ACTIVE_SELENIUM_URL
-
-    if _ACTIVE_SELENIUM_URL is not None:
-        return _ACTIVE_SELENIUM_URL
-
-    last_error: Optional[Exception] = None
-
-    for candidate in SELENIUM_URL_CANDIDATES:
-        try:
-            _wait_for_candidate_ready(candidate, timeout)
-            _ACTIVE_SELENIUM_URL = candidate
-            logger.info("Selenium endpoint selected: %s", candidate)
-            return candidate
-        except SeleniumEndpointUnavailable as exc:
-            last_error = exc
-            logger.warning("Selenium endpoint %s failed readiness check: %s", candidate, exc)
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            logger.warning("Selenium endpoint %s failed readiness check: %s", candidate, exc)
-
-    raise SeleniumEndpointUnavailable(
-        "Brak dostępnego endpointu Selenium. Próbowano: "
-        + ", ".join(SELENIUM_URL_CANDIDATES)
-        + (f". Ostatni błąd: {last_error}" if last_error else "")
-    )
-
-
-def _load_unpatched_remote_webdriver() -> type:
-    """Ładuje oryginalną klasę RemoteWebDriver z Selenium z pominięciem patchy."""
-
-    global _UNPATCHED_REMOTE_CACHE
-
-    if _UNPATCHED_REMOTE_CACHE is not None:
-        return _UNPATCHED_REMOTE_CACHE
-
-    spec = importlib.util.find_spec("selenium.webdriver.remote.webdriver")
-    if spec is None or not spec.origin:
-        raise RuntimeError("Nie można odnaleźć modułu selenium.webdriver.remote.webdriver")
-
-    module_name = "_selenium_unpatched_remote_webdriver"
-    module_spec = importlib.util.spec_from_file_location(module_name, spec.origin)
-    if module_spec is None or module_spec.loader is None:
-        raise RuntimeError("Nie udało się przygotować specyfikacji modułu RemoteWebDriver")
-
-    module = importlib.util.module_from_spec(module_spec)
-    sys.modules[module_name] = module
-    try:
-        module_spec.loader.exec_module(module)
-    finally:
-        sys.modules.pop(module_name, None)
-
-    try:
-        remote_cls = getattr(module, "WebDriver")
-    except AttributeError as exc:
-        raise RuntimeError("Załadowany moduł nie zawiera klasy WebDriver") from exc
-
-    _UNPATCHED_REMOTE_CACHE = remote_cls
-    return remote_cls
-
 
 logger = logging.getLogger(__name__)
 
+LISTING_URL_TEMPLATE = "https://allegro.pl/listing?string={query}"
 
-def _run_proxy_diagnostics(
-    driver,
-    *,
-    proxy_url: Optional[str],
-    user_agent: Optional[str],
-) -> Optional[dict]:
-    """Odwiedza stronę diagnostyczną, aby zebrać informacje o ruchu przez proxy."""
+DEFAULT_HEADERS: Dict[str, str] = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
 
-    if not PROXY_DIAGNOSTIC_URL:
-        return None
-
-    info = {
-        "url": PROXY_DIAGNOSTIC_URL,
-        "proxy": proxy_url,
-        "user_agent": user_agent,
-    }
-
-    forbidden_hits: List[dict] = []
-
-    try:
-        driver.get(PROXY_DIAGNOSTIC_URL)
-        time.sleep(1)
-
-        title = driver.title
-        current_url = driver.current_url
-        body_preview = driver.execute_script(
-            "return document.body ? document.body.innerText.slice(0, arguments[0]) : '';",
-            PROXY_DIAGNOSTIC_BODY_CHARS,
-        )
-
-        info.update(
-            {
-                "title": title,
-                "current_url": current_url,
-                "body_preview": body_preview,
-            }
-        )
-
-        if body_preview:
-            ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", body_preview)
-            if ip_match:
-                info["detected_ip"] = ip_match.group(0)
-
-        if PROXY_DIAGNOSTIC_EXPECT:
-            expectation = PROXY_DIAGNOSTIC_EXPECT
-            matched = any(
-                expectation in (value or "")
-                for value in (title, current_url, body_preview)
-            )
-            info["expectation_matched"] = matched
-            if not matched:
-                logger.warning(
-                    "Proxy diagnostic expectation not met. Expected '%s' in diagnostic output.",
-                    expectation,
-                )
-
-        if PROXY_DIAGNOSTIC_FORBID:
-            scan_targets = [
-                ("title", title or ""),
-                ("current_url", current_url or ""),
-                ("body_preview", body_preview or ""),
-                ("detected_ip", info.get("detected_ip", "")),
-            ]
-
-            lowered_targets = [
-                (field, value, value.lower())
-                for field, value in scan_targets
-                if value
-            ]
-
-            for token in PROXY_DIAGNOSTIC_FORBID:
-                token_lower = token.lower()
-                for field, original, lower_value in lowered_targets:
-                    if token_lower in lower_value:
-                        forbidden_hits.append({"token": token, "field": field, "value": original})
-
-            if forbidden_hits:
-                info["forbidden_matches"] = forbidden_hits
-                logger.warning(
-                    "Proxy diagnostic detected forbidden markers %s (proxy=%s)",
-                    ", ".join(match["token"] for match in forbidden_hits),
-                    proxy_url or "<brak>",
-                )
-
-        logger.info(
-            "Proxy diagnostic completed via %s (title=%s, snippet=%s)",
-            PROXY_DIAGNOSTIC_URL,
-            title,
-            (body_preview or "")[:80],
-        )
-    except Exception as exc:  # noqa: BLE001
-        info["error"] = str(exc)
-        logger.warning("Proxy diagnostic failed via %s: %s", PROXY_DIAGNOSTIC_URL, exc)
-
-    return info
-
-USER_AGENTS: List[str] = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-]
-
-PRICE_SELECTORS: List[str] = [
-    "div[data-role='price'] span",
-    "span[data-role='price']",
-    "article[data-role='offer'] span.m9qz_fv",
-    "article[data-role='offer'] span.m9qz_Fq",
-    "article[data-role='offer'] span[data-analytics-interaction-value='price']",
-    "article[data-role='offer'] span[data-testid='ad-price']",
-    "article[data-role='offer'] span[data-testid='listing-ad-price']",
-]
-
-SOLD_SELECTORS: List[str] = [
-    "article[data-role='offer'] span.msa3_z4",
-    "article[data-role='offer'] span[data-analytics-interaction-value='sold-count']",
-    "article[data-role='offer'] span[data-role='sold-counter']",
-    "article[data-role='offer'] span[class*='sold']",
-    "article[data-role='offer'] span[data-testid='sold-counter']",
-]
-
-BAN_KEYWORDS: List[str] = [
+BAN_KEYWORDS = [
     "twoje żądanie zostało zablokowane",
     "przepraszamy, ale",
     "zbyt wiele zapytań",
     "blocked",
 ]
 
-CAPTCHA_KEYWORDS: List[str] = [
+CAPTCHA_KEYWORDS = [
     "captcha",
     "verify you are human",
     "potwierdź, że nie jesteś robotem",
 ]
 
-CONSENT_BUTTON_SELECTORS: List[str] = [
-    "button[data-role='accept-consent']",
-    "button[data-testid='accept-consent-button']",
-    "button#didomi-notice-agree-button",
-]
-
-NO_RESULTS_KEYWORDS: List[str] = [
+NO_RESULTS_KEYWORDS = [
     "nie znaleźliśmy",
     "brak wyników",
     "spróbuj zmienić frazę",
 ]
 
+PRICE_REGEXES = [
+    re.compile(r"\"price\"\s*:\s*\{\s*\"amount\"\s*:\s*\"([\d., ]+)\"", re.IGNORECASE),
+    re.compile(r"\"amount\"\s*:\s*\"([\d., ]+)\"", re.IGNORECASE),
+    re.compile(r"data-testid=\"listing-ad-price\"[^>]*>([\d., ]+)\s*zł", re.IGNORECASE),
+]
 
-def _parse_price(price_text: str) -> Optional[float]:
-    """Helper do parsowania ceny (usuwa 'zł', ' ', ',')"""
-    if not price_text:
-        return None
-    try:
-        txt = "".join(ch for ch in price_text if ch.isdigit() or ch in ".,")
-        txt = txt.replace(",", ".").replace(" ", "")
-        return float(txt) if txt else None
-    except Exception:
-        return None
-
-
-def _parse_sold_count(sold_text: str) -> Optional[int]:
-    """Helper do parsowania liczby sprzedanych (np. '100 osób kupiło')"""
-    if not sold_text:
-        return None
-    try:
-        match = re.search(r"\d+", sold_text.replace(" ", ""))
-        return int(match.group(0)) if match else None
-    except Exception:
-        return None
+SOLD_REGEXES = [
+    re.compile(r"(\d+)\s*(?:osób kupiło|osoby kupiły|sprzedanych|sold)", re.IGNORECASE),
+    re.compile(r"sprzedano\s*(\d+)", re.IGNORECASE),
+]
 
 
-def _split_proxy_values() -> List[str]:
-    """Zwraca listę dostępnych proxy na podstawie PROXY_URL"""
+def _build_proxy_url() -> Optional[Dict[str, str]]:
+    """Zwraca słownik proxy dla httpx z poprawnie osadzonymi poświadczeniami."""
+
     if not PROXY_URL:
-        return []
+        return None
 
-    candidates = re.split(r"[;,\s]+", PROXY_URL)
-    proxies: List[str] = []
-    for candidate in candidates:
-        candidate = candidate.strip()
-        if not candidate:
-            continue
-        if "://" not in candidate:
-            candidate = f"http://{candidate}"
-        proxies.append(candidate)
-    return proxies
-
-
-def _build_proxy_extension(
-    scheme: str, host: str, port: int, username: str, password: str
-) -> str:
-    """Tworzy w locie rozszerzenie Chrome z uwierzytelnianiem proxy"""
-    manifest_json = """
-    {
-        "version": "1.0.0",
-        "manifest_version": 3,
-        "name": "Chrome Proxy",
-        "permissions": [
-            "proxy",
-            "webRequest",
-            "webRequestAuthProvider"
-        ],
-        "host_permissions": [
-            "<all_urls>"
-        ],
-        "background": {{
-            "service_worker": "background.js"
-        }}
-    }}
-    """
-
-    # Ta logika jest poprawna - łączy V3 'proxy.settings' z 'webRequest'
-    background_js = f"""
-    var config = {{
-            mode: "fixed_servers",
-            rules: {{
-            singleProxy: {{
-                scheme: "{scheme}",
-                host: "{host}",
-                port: parseInt({port})
-            }},
-            bypassList: ["localhost", "127.0.0.1"]
-            }}
-        }};
-
-    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
-
-    function callbackFn(details) {{
-        return {{
-            authCredentials: {{
-                username: "{username}",
-                password: "{password}"
-            }}
-        }};
-    }}
-
-    chrome.webRequest.onAuthRequired.addListener(
-                callbackFn,
-                {{ "urls": ["<all_urls>"] }},
-                ['blocking', 'asyncBlocking']
-    );
-    """
-
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr("manifest.json", manifest_json)
-        zip_file.writestr("background.js", background_js)
-
-    return base64.b64encode(zip_buffer.getvalue()).decode("utf-8")
-
-
-def _prepare_proxy(
-    proxy_url: str,
-) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, str]]]:
-    """Zwraca argument proxy, rozszerzenie oraz dodatkowe capability"""
-    parsed = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
-    host = parsed.hostname
-    port = parsed.port
-    if not host or not port:
-        return None, None, None
-
+    parsed = urlparse(PROXY_URL)
     scheme = parsed.scheme or "http"
-    proxy_argument = f"{scheme}://{host}:{port}"
+    hostname = parsed.hostname
 
-    username = parsed.username or PROXY_USERNAME
-    password = parsed.password or PROXY_PASSWORD
+    if not hostname:
+        logger.warning("Niepoprawna konfiguracja PROXY_URL: brak hosta")
+        return None
 
-    capability = {
-        "proxyType": "manual",
-        "httpProxy": f"{host}:{port}",
-        "sslProxy": f"{host}:{port}",
-    }
+    port = f":{parsed.port}" if parsed.port else ""
+    username = PROXY_USERNAME or parsed.username
+    password = PROXY_PASSWORD or parsed.password
 
-    extension = None
     if username and password:
-        extension = _build_proxy_extension(scheme, host, port, username, password)
-
-    return proxy_argument, extension, capability
-
-
-def get_driver(user_agent: Optional[str] = None, proxy_url: Optional[str] = None):
-    """Tworzy instancję zdalnej przeglądarki Chrome w kontenerze Selenium"""
-    options = ChromeOptions()
-
-    if SELENIUM_HEADLESS:
-        options.add_argument("--headless=new")
+        netloc = f"{quote(username, safe='')}:{quote(password, safe='')}@{hostname}{port}"
     else:
-        logger.info("Selenium running in non-headless mode (VNC debugging enabled)")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("start-maximized")
-    options.add_argument("disable-infobars")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
+        netloc = f"{hostname}{port}"
 
-    if user_agent:
-        options.add_argument(f"user-agent={user_agent}")
-
-    if proxy_url:
-        proxy_argument, proxy_extension, proxy_capability = _prepare_proxy(proxy_url)
-        if proxy_argument:
-            options.add_argument(f"--proxy-server={proxy_argument}")
-        if proxy_extension:
-            options.add_encoded_extension(proxy_extension)
-        if proxy_capability:
-            options.set_capability("proxy", proxy_capability)
-
-    selenium_endpoint = _ensure_selenium_ready()
-
-    driver_factory = RemoteWebDriver
-    try:
-        driver = driver_factory(
-            command_executor=selenium_endpoint,
-            options=options,
-        )
-    except TypeError as exc:
-        if "desired_capabilities" not in str(exc):
-            raise
-
-        logger.warning(
-            "RemoteWebDriver zgłosił TypeError dotyczący desired_capabilities, próbuję ponownie z klasą bez patchy: %s",
-            exc,
-        )
-        driver_factory = _load_unpatched_remote_webdriver()
-        driver = driver_factory(
-            command_executor=selenium_endpoint,
-            options=options,
-        )
-
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    driver.set_page_load_timeout(30)
-
-    return driver
-
-
-def _contains_any(source: str, keywords: List[str]) -> bool:
-    """Sprawdza, czy w źródle znajduje się jakiekolwiek słowo kluczowe"""
-    lower_source = source.lower()
-    return any(keyword in lower_source for keyword in keywords)
-
-
-def _find_first_text(driver, selectors: List[str]) -> Optional[str]:
-    """Zwraca tekst pierwszego znalezionego elementu dla podanych selektorów"""
-    for selector in selectors:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        except Exception:
-            continue
-        for element in elements:
-            text = (element.text or "").strip()
-            if not text:
-                text = (element.get_attribute("innerText") or "").strip()
-            if text:
-                return text
-    return None
-
-
-def _detect_no_results(page_source: str) -> bool:
-    """Detekcja strony z brakiem wyników"""
-    return _contains_any(page_source, NO_RESULTS_KEYWORDS)
-
-
-def _accept_cookies(driver) -> bool:
-    """Próbuje zaakceptować zgodę na cookies, jeśli baner ją blokuje"""
-    for selector in CONSENT_BUTTON_SELECTORS:
-        try:
-            button = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-            )
-            button.click()
-            time.sleep(0.5)
-            return True
-        except Exception:
-            continue
-
-    # fallback na wyszukiwanie po tekście
-    try:
-        button = WebDriverWait(driver, 3).until(
-            EC.element_to_be_clickable((
-                By.XPATH,
-                "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'przejdź do serwisu')]",
-            ))
-        )
-        button.click()
-        time.sleep(0.5)
-        return True
-    except Exception:
-        return False
-
-
-def _extract_price(driver, page_source: str) -> Optional[float]:
-    """Pobiera najniższą cenę z listingu"""
-    price_text = _find_first_text(driver, PRICE_SELECTORS)
-    if price_text:
-        parsed = _parse_price(price_text)
-        if parsed is not None:
-            return parsed
-
-    match = re.search(r'"price"\s*:\s*\{\s*"amount"\s*:\s*"([\d.,]+)"', page_source)
-    if not match:
-        match = re.search(r'"price"\s*:\s*\{\s*"value"\s*:\s*"([\d.,]+)"', page_source)
-    if match:
-        return _parse_price(match.group(1))
-
-    match = re.search(r'data-analytics-price\s*=\s*"([\d.,]+)"', page_source)
-    if not match:
-        match = re.search(r'"lowestPrice"\s*:\s*"([\d.,]+)"', page_source)
-    if match:
-        return _parse_price(match.group(1))
-
-    return None
-
-
-def _extract_sold_count(driver, page_source: str) -> Optional[int]:
-    """Pobiera liczbę sprzedanych sztuk"""
-    sold_text = _find_first_text(driver, SOLD_SELECTORS)
-    if sold_text:
-        parsed = _parse_sold_count(sold_text)
-        if parsed is not None:
-            return parsed
-
-    match = re.search(r"(\d+)\s*(osób kupiło|sprzedanych|sold)", page_source, re.IGNORECASE)
-    if match:
-        try:
-            return int(match.group(1))
-        except ValueError:
-            return None
-
-    match = re.search(r'"soldQuantity"\s*:\s*(\d+)', page_source)
-    if match:
-        try:
-            return int(match.group(1))
-        except ValueError:
-            return None
-    return None
-
-
-def _extract_listing_snapshot(driver) -> List[dict]:
-    """Pobiera z DOM kilka pierwszych ofert wraz z ceną i liczbą sprzedaży"""
-    try:
-        entries = driver.execute_script(
-            """
-            const offers = Array.from(document.querySelectorAll("article[data-role='offer']"));
-            return offers.slice(0, 5).map(offer => ({
-                price: (offer.querySelector("[data-role='price'], span[data-testid='ad-price'], span[data-testid='listing-ad-price']")?.textContent || '').trim(),
-                sold: (offer.querySelector("[data-role='sold-counter'], span[data-testid='sold-counter'], span[class*='sold']")?.textContent || '').trim()
-            }));
-            """
-        )
-        return entries or []
-    except Exception:
-        return []
-
-
-def _failure_response(
-    ean: str, error: Optional[Exception], diagnostics: Optional[dict] = None
-):
-    """Buduje odpowiedź dla nieudanej próby wraz z alertem."""
-
-    logger.error("Nie udało się pobrać danych Allegro dla EAN %s: %s", ean, error)
-
-    alert_sent = False
-    if error:
-        send_scraper_alert(
-            "allegro_scrape_failed",
-            {
-                "ean": ean,
-                "error": str(error),
-            },
-        )
-        alert_sent = True
+    proxy_target = urlunparse((scheme, netloc, parsed.path or "", parsed.params, parsed.query, parsed.fragment))
 
     return {
-        "lowest_price": None,
-        "sold_count": None,
-        "source": "failed",
-        "fetched_at": datetime.now(timezone.utc),
-        "not_found": False,
-        "error": str(error) if error else None,
-        "alert_sent": alert_sent,
-        "diagnostics": diagnostics,
+        "http://": proxy_target,
+        "https://": proxy_target,
     }
 
 
-def fetch_allegro_data(ean: str, use_api: bool = False, api_key: Optional[str] = None):
-    """Scraper Allegro z rotacją proxy/UA, retry i detekcją banów"""
+def _contains_keyword(text: str, keywords: list[str]) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in keywords)
 
-    if use_api and api_key:
-        # API jest opcjonalne – aktualnie pomijamy, bo nie zwraca wymaganych danych
-        pass
 
-    proxies = _split_proxy_values()
-    agents_pool = USER_AGENTS[:]
-    random.shuffle(agents_pool)
-    proxies_cycle = proxies.copy()
-    if proxies_cycle:
-        random.shuffle(proxies_cycle)
+def _clean_number(value: str) -> Optional[float]:
+    filtered = "".join(ch for ch in value if ch.isdigit() or ch in ".,")
+    if not filtered:
+        return None
+    normalized = filtered.replace(" ", "").replace(",", ".")
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
 
-    last_error: Optional[Exception] = None
-    last_diagnostics: Optional[dict] = None
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        user_agent = agents_pool[(attempt - 1) % len(agents_pool)] if agents_pool else None
-        proxy_url = None
-        if proxies_cycle:
-            proxy_url = proxies_cycle[(attempt - 1) % len(proxies_cycle)]
+def _extract_price(html: str) -> Optional[float]:
+    for pattern in PRICE_REGEXES:
+        match = pattern.search(html)
+        if match:
+            price = _clean_number(match.group(1))
+            if price is not None:
+                return price
+    return None
 
-        diagnostics_info = None
-        driver = None
-        try:
-            driver = get_driver(user_agent=user_agent, proxy_url=proxy_url)
-            diagnostics_info = _run_proxy_diagnostics(
-                driver,
-                proxy_url=proxy_url,
-                user_agent=user_agent,
-            )
-            if diagnostics_info:
-                last_diagnostics = diagnostics_info.copy()
 
-                if diagnostics_info.get("error"):
-                    last_error = RuntimeError(
-                        f"Proxy diagnostic failed: {diagnostics_info['error']}"
-                    )
-                    logger.warning(
-                        "Proxy diagnostic returned an error (attempt %s, EAN %s): %s",
-                        attempt,
-                        ean,
-                        diagnostics_info["error"],
-                    )
-                    continue
-
-                if (
-                    PROXY_DIAGNOSTIC_EXPECT
-                    and not diagnostics_info.get("expectation_matched", False)
-                ):
-                    last_error = RuntimeError(
-                        "Proxy diagnostic expectation not met"
-                    )
-                    logger.warning(
-                        "Proxy diagnostic expectation not met (attempt %s, EAN %s)."
-                        " Expecting '%s' in diagnostic output.",
-                        attempt,
-                        ean,
-                        PROXY_DIAGNOSTIC_EXPECT,
-                    )
-                    continue
-
-                forbidden_matches = diagnostics_info.get("forbidden_matches") or []
-                if forbidden_matches:
-                    tokens = ", ".join(
-                        match.get("token") or str(match.get("value"))
-                        for match in forbidden_matches
-                        if match
-                    )
-                    error_message = (
-                        "Proxy diagnostic detected forbidden markers"
-                        + (f": {tokens}" if tokens else "")
-                    )
-                    logger.warning(
-                        "Proxy diagnostic detected forbidden markers (attempt %s, EAN %s): %s",
-                        attempt,
-                        ean,
-                        tokens or "<unknown>",
-                    )
-                    return _failure_response(
-                        ean,
-                        RuntimeError(error_message),
-                        diagnostics_info,
-                    )
-            listing_url = f"https://allegro.pl/listing?string={ean}"
-            driver.get(listing_url)
-
-            _accept_cookies(driver)
-
+def _extract_sold_count(html: str) -> Optional[int]:
+    for pattern in SOLD_REGEXES:
+        match = pattern.search(html)
+        if match:
             try:
-                WebDriverWait(driver, 15).until(
-                    lambda d: (
-                        _detect_no_results(d.page_source)
-                        or bool(d.find_elements(By.CSS_SELECTOR, "article[data-role='offer']"))
-                    )
-                )
-            except TimeoutException as exc:
-                last_error = exc
-                logger.warning("Timeout oczekiwania na listing (attempt %s, EAN %s)", attempt, ean)
+                return int(match.group(1))
+            except ValueError:
                 continue
+    return None
 
-            # dodatkowy, krótki czas na pełne wczytanie komponentów cenowych
-            time.sleep(1 + random.uniform(0.2, 0.8))
 
-            page_source = driver.page_source
+def _base_result(
+    *,
+    source: str,
+    fetched_at: datetime,
+    lowest_price: Optional[float] = None,
+    sold_count: Optional[int] = None,
+    not_found: bool = False,
+    error: Optional[str] = None,
+    alert_sent: bool = False,
+) -> Dict[str, object]:
+    return {
+        "lowest_price": lowest_price,
+        "sold_count": sold_count,
+        "source": source,
+        "fetched_at": fetched_at,
+        "not_found": not_found,
+        "error": error,
+        "alert_sent": alert_sent,
+    }
 
-            if _contains_any(page_source, BAN_KEYWORDS):
-                logger.warning("Wykryto bana przy EAN %s (proxy=%s, ua=%s)", ean, proxy_url, user_agent)
-                send_scraper_alert(
-                    "allegro_ban_detected",
-                    {
-                        "ean": ean,
-                        "proxy": proxy_url or "<brak>",
-                        "user_agent": user_agent or "<brak>",
-                    },
-                )
-                return {
-                    "lowest_price": None,
-                    "sold_count": None,
-                    "source": "ban_detected",
-                    "fetched_at": datetime.now(timezone.utc),
-                    "not_found": False,
-                    "alert_sent": True,
-                    "diagnostics": diagnostics_info or last_diagnostics,
-                }
 
-            if _contains_any(page_source, CAPTCHA_KEYWORDS):
-                logger.warning("Wykryto CAPTCHA przy EAN %s (proxy=%s, ua=%s)", ean, proxy_url, user_agent)
-                send_scraper_alert(
-                    "allegro_captcha_detected",
-                    {
-                        "ean": ean,
-                        "proxy": proxy_url or "<brak>",
-                        "user_agent": user_agent or "<brak>",
-                    },
-                )
-                return {
-                    "lowest_price": None,
-                    "sold_count": None,
-                    "source": "captcha_detected",
-                    "fetched_at": datetime.now(timezone.utc),
-                    "not_found": False,
-                    "alert_sent": True,
-                    "diagnostics": diagnostics_info or last_diagnostics,
-                }
+def fetch_allegro_data(ean: str, **kwargs) -> Dict[str, object]:
+    """Pobiera dane ofert z Allegro wykorzystując lekki klient HTTP."""
 
-            if _detect_no_results(page_source):
-                return {
-                    "lowest_price": None,
-                    "sold_count": None,
-                    "source": "scrape",
-                    "fetched_at": datetime.now(timezone.utc),
-                    "not_found": True,
-                    "diagnostics": diagnostics_info or last_diagnostics,
-                }
+    fetched_at = datetime.now(timezone.utc)
+    proxies = _build_proxy_url()
+    url = LISTING_URL_TEMPLATE.format(query=quote_plus(ean))
 
-            listing_snapshot = _extract_listing_snapshot(driver)
-            if listing_snapshot:
-                for snapshot_entry in listing_snapshot:
-                    if snapshot_entry.get("price"):
-                        parsed_price = _parse_price(snapshot_entry["price"])
-                        if parsed_price is not None:
-                            sold_from_snapshot = _parse_sold_count(snapshot_entry.get("sold"))
-                            return {
-                                "lowest_price": parsed_price,
-                                "sold_count": sold_from_snapshot,
-                                "source": "selenium_rotating",
-                                "fetched_at": datetime.now(timezone.utc),
-                                "not_found": False,
-                                "diagnostics": diagnostics_info or last_diagnostics,
-                            }
+    try:
+        with Client(
+            proxies=proxies,
+            impersonate="chrome120",
+            timeout=30.0,
+            follow_redirects=True,
+        ) as client:
+            response = client.get(url, headers=DEFAULT_HEADERS)
+    except HTTPError as exc:
+        logger.error("HTTP błąd podczas pobierania Allegro EAN %s: %s", ean, exc)
+        return _base_result(
+            source="failed",
+            fetched_at=fetched_at,
+            error=str(exc),
+        )
+    except Exception as exc:  # pragma: no cover - ochrona przed nieoczekiwanymi wyjątkami
+        logger.exception("Nieoczekiwany błąd httpx dla EAN %s", ean)
+        return _base_result(
+            source="failed",
+            fetched_at=fetched_at,
+            error=str(exc),
+        )
 
-            lowest_price = _extract_price(driver, page_source)
-            sold_count = _extract_sold_count(driver, page_source)
+    html = response.text
 
-            if lowest_price is not None:
-                return {
-                    "lowest_price": lowest_price,
-                    "sold_count": sold_count,
-                    "source": "selenium_rotating",
-                    "fetched_at": datetime.now(timezone.utc),
-                    "not_found": False,
-                    "diagnostics": diagnostics_info or last_diagnostics,
-                }
-            else:
-                last_error = RuntimeError("Price not found in Allegro listing HTML")
+    if response.status_code in {403, 429} or _contains_keyword(html, BAN_KEYWORDS):
+        message = f"Allegro zablokowało zapytanie (status {response.status_code})."
+        send_scraper_alert("allegro_ban_detected", {"ean": ean, "status": response.status_code})
+        return _base_result(
+            source="ban_detected",
+            fetched_at=fetched_at,
+            error=message,
+            alert_sent=True,
+        )
 
-        except TimeoutException as exc:
-            last_error = exc
-            logger.warning("Timeout Selenium (attempt %s, EAN %s): %s", attempt, ean, exc)
-        except SeleniumEndpointUnavailable as exc:
-            last_error = exc
-            logger.error("Błąd infrastruktury Selenium (attempt %s, EAN %s): %s", attempt, ean, exc)
-            return _failure_response(ean, exc, diagnostics_info or last_diagnostics)
-        except Exception as exc:
-            last_error = exc
-            logger.exception("Błąd Selenium (attempt %s, EAN %s)", attempt, ean)
-        finally:
-            if driver:
-                driver.quit()
+    if _contains_keyword(html, CAPTCHA_KEYWORDS):
+        message = "Allegro wymaga weryfikacji CAPTCHA."
+        send_scraper_alert("allegro_captcha_detected", {"ean": ean})
+        return _base_result(
+            source="captcha_detected",
+            fetched_at=fetched_at,
+            error=message,
+            alert_sent=True,
+        )
 
-        # backoff przed kolejną próbą
-        if attempt != MAX_ATTEMPTS:
-            time.sleep(BASE_BACKOFF_SECONDS * attempt)
+    if response.status_code == 404 or _contains_keyword(html, NO_RESULTS_KEYWORDS):
+        return _base_result(
+            source="allegro_httpx",
+            fetched_at=fetched_at,
+            not_found=True,
+        )
 
-    return _failure_response(ean, last_error, last_diagnostics)
+    price = _extract_price(html)
+    sold_count = _extract_sold_count(html)
+
+    if price is None and sold_count is None:
+        logger.warning("Nie udało się odnaleźć danych w HTML Allegro dla EAN %s", ean)
+        return _base_result(
+            source="failed",
+            fetched_at=fetched_at,
+            error="Brak danych w odpowiedzi Allegro",
+        )
+
+    return _base_result(
+        source="allegro_httpx",
+        fetched_at=fetched_at,
+        lowest_price=price,
+        sold_count=sold_count,
+    )
+
