@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 from urllib.parse import quote, quote_plus, urlparse, urlunparse
 
-from httpx import HTTPError
+# --- POPRAWKA: Importujemy Timeout ---
+from httpx import HTTPError, Timeout
 from httpx_impersonate import Client
 
 from ..config import PROXY_PASSWORD, PROXY_URL, PROXY_USERNAME
@@ -156,27 +157,27 @@ def fetch_allegro_data(ean: str, **kwargs) -> Dict[str, object]:
     proxies = _build_proxy_url()
     url = LISTING_URL_TEMPLATE.format(query=quote_plus(ean))
 
+    # --- POPRAWKA: Ustawiamy agresywny timeout dla connect i read ---
+    # Czekaj max 10s na połączenie, max 20s na odczyt.
+    timeout_config = Timeout(20.0, connect=10.0)
+
     try:
         with Client(
             proxies=proxies,
             impersonate="chrome120",
-            timeout=30.0,
+            timeout=timeout_config, # <-- Zastosowanie nowej konfiguracji
             follow_redirects=True,
         ) as client:
             response = client.get(url, headers=DEFAULT_HEADERS)
-    except HTTPError as exc:
-        logger.error("HTTP błąd podczas pobierania Allegro EAN %s: %s", ean, exc)
-        return _base_result(
-            source="failed",
-            fetched_at=fetched_at,
-            error=str(exc),
-        )
+    
+    # --- POPRAWKA: Łapiemy wszystkie błędy, w tym TimeoutException ---
     except Exception as exc:  # pragma: no cover - ochrona przed nieoczekiwanymi wyjątkami
-        logger.exception("Nieoczekiwany błąd httpx dla EAN %s", ean)
+        logger.error("Błąd krytyczny httpx (w tym Timeout) dla EAN %s: %s", ean, exc)
         return _base_result(
             source="failed",
             fetched_at=fetched_at,
-            error=str(exc),
+            # Zwracamy błąd, aby worker mógł go odnotować
+            error=f"Timeout lub błąd połączenia: {exc}", 
         )
 
     html = response.text
@@ -208,6 +209,15 @@ def fetch_allegro_data(ean: str, **kwargs) -> Dict[str, object]:
             not_found=True,
         )
 
+    # --- POPRAWKA: Łapiemy inne błędy HTTP ---
+    if response.status_code >= 400:
+        logger.error("Nieobsłużony błąd HTTP %s dla EAN %s", response.status_code, ean)
+        return _base_result(
+            source="failed",
+            fetched_at=fetched_at,
+            error=f"Nieobsłużony status HTTP: {response.status_code}",
+        )
+
     price = _extract_price(html)
     sold_count = _extract_sold_count(html)
 
@@ -216,7 +226,8 @@ def fetch_allegro_data(ean: str, **kwargs) -> Dict[str, object]:
         return _base_result(
             source="failed",
             fetched_at=fetched_at,
-            error="Brak danych w odpowiedzi Allegro",
+            not_found=True, # Traktujemy to jako not_found
+            error="Brak danych w odpowiedzi Allegro (nie znaleziono ceny ani sprzedanych)",
         )
 
     return _base_result(
@@ -225,4 +236,3 @@ def fetch_allegro_data(ean: str, **kwargs) -> Dict[str, object]:
         lowest_price=price,
         sold_count=sold_count,
     )
-
