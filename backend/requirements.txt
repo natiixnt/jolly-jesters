@@ -15,5 +15,5 @@ pydantic
 uvicorn
 python-multipart
 httpx
-httpx-impersonate
+-e ./vendor/httpx-impersonate/
 blinker==1.6.2
