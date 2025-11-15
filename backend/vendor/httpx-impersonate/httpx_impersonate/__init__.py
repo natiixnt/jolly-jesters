@@ -68,6 +68,22 @@ def _merge_headers(defaults: Optional[Mapping[str, str]], overrides: Optional[Ma
     return merged
 
 
+def _coerce_timeout(value: Optional[float]) -> Optional[int]:
+    if value is None:
+        return None
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive guard
+        logger.debug("invalid timeout value %r, ignoring", value)
+        return None
+
+    if numeric <= 0:
+        return None
+
+    return int(round(numeric))
+
+
 class Client:
     """Thin wrapper around :class:`tls_client.Session` mimicking httpx' API."""
 
@@ -84,7 +100,7 @@ class Client:
         identifier = _normalize_identifier(impersonate)
         self._session = tls_client.Session(client_identifier=identifier)
         self._proxies = _normalize_proxies(proxies)
-        self._timeout = timeout
+        self._timeout = _coerce_timeout(timeout)
         self._follow_redirects = follow_redirects
         self._default_headers = headers
 
@@ -92,7 +108,8 @@ class Client:
             self._session.proxies = self._proxies
 
         try:
-            self._session.timeout_seconds = timeout
+            if self._timeout is not None:
+                self._session.timeout_seconds = self._timeout
         except Exception:  # pragma: no cover - attribute may not exist on old builds
             logger.debug("tls_client session does not expose timeout_seconds attribute")
 
@@ -125,13 +142,13 @@ class Client:
     ):
         final_headers = _merge_headers(self._default_headers, headers)
         allow_redirects = self._follow_redirects if follow_redirects is None else follow_redirects
-        timeout_seconds = timeout if timeout is not None else self._timeout
+        timeout_seconds = _coerce_timeout(timeout) if timeout is not None else self._timeout
         proxy_mapping = proxy or self._proxies
 
         if proxy_mapping and not isinstance(proxy_mapping, Mapping):
             raise TypeError("proxy must be a mapping of scheme to URL")
 
-        response = self._session.execute_request(
+        request_kwargs = dict(
             method=method.upper(),
             url=url,
             params=dict(params) if params else None,
@@ -140,9 +157,13 @@ class Client:
             cookies=dict(cookies) if cookies else None,
             headers=final_headers,
             allow_redirects=allow_redirects,
-            timeout_seconds=timeout_seconds,
             proxy=dict(proxy_mapping) if proxy_mapping else None,
         )
+
+        if timeout_seconds is not None:
+            request_kwargs["timeout_seconds"] = timeout_seconds
+
+        response = self._session.execute_request(**request_kwargs)
 
         return response
 
