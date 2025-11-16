@@ -14,18 +14,18 @@ import time        # <-- race condition fix
 from kombu import Queue
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from .database import SessionLocal
+# ZMIANA: Importujemy tylko to, co potrzebne, zeby uniknac bledu z forkiem
+from .database import SessionLocal, engine 
 
 from . import models
-# from .services.allegro_scraper import fetch_allegro_data as scraper_fetch # <-- USUNIETE (juz niepotrzebne)
+# usunieto: from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
 from .services.alerts import send_scraper_alert
 from .config import CACHE_TTL_DAYS
 
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery = Celery("app.tasks", broker=CELERY_BROKER)
 
-# Ensure parsing jobs (default queue) are never starved behind a long backlog of
-# scraping jobs by routing the heavy Selenium work to a dedicated queue.
+# celery config
 celery.conf.task_default_queue = "celery"
 celery.conf.task_queues = (
     Queue("celery", routing_key="celery"),
@@ -37,21 +37,45 @@ celery.conf.task_routes = {
         "routing_key": "scraper",
     }
 }
-# Prevent the worker from prefetching a large batch of scraping tasks at once –
-# this keeps at least one process free to pick up new parsing jobs quickly.
 celery.conf.worker_prefetch_multiplier = 1
+
+# --- START POPRAWKI: Unikanie bledu Celery/SQLAlchemy fork ---
+# https://docs.celeryq.dev/en/stable/userguide/tasks.html#database-sessions
+# zamykamy polaczenia engine po forku  zeby workery mialy swieze
+@celery.signals.worker_process_init.connect
+def init_db_connection(**kwargs):
+    logger.info("Initializing DB connection for worker process...")
+    engine.dispose(close=True)
+
+def with_db_session(func):
+    """Decorator to provide a db session to a task."""
+    def wrapper(*args, **kwargs):
+        db = SessionLocal()
+        try:
+            result = func(db, *args, **kwargs)
+            db.commit() # commit na koniec  jesli wszystko ok
+            return result
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Task failed, rolling back session. Error: {e}")
+            # ponowne wywolanie bledu  zeby celery zarejestrowal jako 'failure'
+            raise e
+        finally:
+            db.close()
+    return wrapper
+# --- KONIEC POPRAWKI ---
 
 
 def update_job_error(db: Session, job: models.ImportJob, message: str):
     """Pomocnik do aktualizowania statusu błędu w bazie"""
     job.status = "error"
     job.notes = message
-    db.commit()
-
+    # usunieto db.commit() - decorator 'with_db_session' sie tym zajmie
 
 ACTIVE_STATUSES = {"pending", "queued", "processing"}
 
-
+# ZMIANA: Uzywamy decoratora do zarzadzania sesja
+@with_db_session
 def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
     """Aktualizuje status zadania, jeśli wszystkie produkty zakończyły przetwarzanie."""
 
@@ -116,8 +140,7 @@ def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
             job.notes = f"Zakończono. Nie znaleziono: {not_found_count}/{total_products}."
         else:
             job.notes = None
-
-    db.commit()
+    # usunieto db.commit()
 
 # --- Funkcje pomocnicze do analizy (bez zmian) ---
 
@@ -207,9 +230,9 @@ def fetch_with_antibot(ean: str) -> dict:
     logger.info(f"[Antibot] running for EAN: {ean}")
     
     try:
-        # assume antibot.exe is in /app/
+        # assume antibot.exe is in /usr/local/bin/
         process = subprocess.Popen(
-            ["/app/antibot.exe", ean], # use full path
+            ["/usr/local/bin/antibot", ean], # POPRAWKA: sciezka do pliku
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -262,7 +285,7 @@ def fetch_with_antibot(ean: str) -> dict:
         }
 
     except FileNotFoundError:
-        logger.critical(f"[Antibot] File /app/antibot.exe not found!")
+        logger.critical(f"[Antibot] File /usr/local/bin/antibot not found!") # POPRAWKA: sciezka w logu
         return {"ean": ean, "source": "antibot_error", "not_found": True, "error": "antibot.exe not found", "last_checked_at": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
         logger.error(f"[Antibot] Critical subprocess error for EAN {ean}: {e}")
@@ -275,13 +298,13 @@ def parse_import_file(self, import_job_id: int, filepath: str):
     """
     Krok 1: Parsuje wgrany plik, tworzy ProductInput i kolejkuje zadania fetch_allegro_data
     """
+    # ZMIANA: Uzywamy 'with' dla sesji, zeby miec pewnosc zamkniecia
     db = SessionLocal()
-    job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
-    if not job:
-        db.close()
-        return
-
     try:
+        job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
+        if not job:
+            return # job nie istnieje
+
         job.status = "processing"
         job.notes = None
         db.commit()
@@ -330,8 +353,7 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         if missing_cols:
              raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
 
-        # --- POPRAWKA (KROK 33): Usunięcie błędnego bloku 'if not df.is_copy:' ---
-        # Ten blok powodował awarię AttributeError.
+        # usunieto: bledny blok 'if not df.is_copy:'
         
         df.loc[:, "ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df.loc[:, "name_norm"] = df[name_col].astype(str).str.strip()
@@ -372,32 +394,23 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             for product_id, product_ean in task_payloads:
                 fetch_allegro_data.delay(product_id, product_ean)
         except Exception as exc:
-            db_error_session = SessionLocal()
-            job_to_update = (
-                db_error_session.query(models.ImportJob)
-                .filter(models.ImportJob.id == import_job_id)
-                .first()
-            )
-            if job_to_update:
-                update_job_error(
-                    db_error_session,
-                    job_to_update,
-                    f"Nie udało się zlecić zadań scrapera: {exc}",
-                )
-            db_error_session.close()
+            # ZMIANA: Jesli kolejkowanie sie nie uda, uzyj biezacej sesji 'db'
+            job.status = "error"
+            job.notes = f"Nie udało się zlecić zadań scrapera: {exc}"
+            db.commit()
             raise
 
     except (ValueError, Exception) as e:
         db.rollback()
-        db_error_session = SessionLocal()
-        job_to_update = db_error_session.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
+        # ZMIANA: Uzyj biezacej sesji 'db' do zapisu bledu
+        job_to_update = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
         if job_to_update:
-            update_job_error(db_error_session, job_to_update, str(e))
-        db_error_session.close()
+            update_job_error(db, job_to_update, str(e))
+            db.commit() # commit po update_job_error
         
         raise e 
     finally:
-        db.close()
+        db.close() # Zawsze zamykaj sesje na koniec
 
 
 @celery.task(bind=True, acks_late=True, max_retries=3)
@@ -405,120 +418,123 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
     """
     Krok 2: Pobiera dane z Allegro (z logiką cache)
     """
-    db = SessionLocal()
-    try:
-        # --- START FIX: Race condition read-after-write ---
-        # sometimes the worker picks up the task before the parse_import_file transaction commits
-        # we give it a moment to try and find the product
-        p = None
-        for _ in range(3): # try 3 times
-            p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
-            if p:
-                break # found it
-            logger.warning(f"[fetch_allegro_data] ProductInput.id {product_input_id} not found (race condition?), retrying in 0.5s...")
-            time.sleep(0.5)
-
-        if not p:
-            logger.error(f"[fetch_allegro_data] CRITICAL: ProductInput.id {product_input_id} not found after 3 retries. Task stopping.")
-            db.close()
-            return # return success (None) to not block the queue
-        # --- END FIX ---
-
-        import_job_id = p.import_job_id
-
-        cache = db.query(models.AllegroCache).filter(models.AllegroCache.ean == ean).first()
-        ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
-
-        if cache and cache.fetched_at > ttl_limit:
-            if cache.source not in ['failed', 'error', 'ban_detected', 'captcha_detected']:
-                if cache.not_found:
-                    p.status = "not_found"
-                    p.notes = f"Cached not_found @ {cache.fetched_at.date()}"
-                else:
-                    p.status = "done"
-                    p.notes = f"Cached data @ {cache.fetched_at.date()}"
-                db.commit()
-                # musimy wywolac finalize rowniez dla cache'u
-                finalize_job_if_complete(db, import_job_id)
-                db.close()
-                return 
-            
-        p.status = "processing"
-        db.commit()
-
-        # --- POCZATEK INTEGRACJI ANTIBOT.EXE ---
-    
-        # 1. Wywolaj nowa funkcje zamiast scraper_fetch
-        raw_result = fetch_with_antibot(ean)
-        
-        # 2. Zmapuj wynik z antibot.exe na format 'result'  ktorego oczekuje reszta zadania
+    # ZMIANA: Uzywamy 'with' dla sesji
+    with SessionLocal() as db:
         try:
-            # proba parsowania daty z isoformatu
-            fetched_at_dt = datetime.fromisoformat(raw_result["last_checked_at"])
-        except (ValueError, TypeError, KeyError):
-            fetched_at_dt = datetime.now(timezone.utc) # fallback
+            # --- START FIX: Race condition read-after-write ---
+            p = None
+            for _ in range(3): # try 3 times
+                p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
+                if p:
+                    break # found it
+                logger.warning(f"[fetch_allegro_data] ProductInput.id {product_input_id} not found (race condition?), retrying in 0.5s...")
+                time.sleep(0.5)
 
-        result = {
-            "lowest_price": raw_result.get("allegro_lowest_price"),
-            "sold_count": raw_result.get("sold_count"),
-            "source": raw_result.get("source", "antibot_exe"),
-            "fetched_at": fetched_at_dt,
-            "not_found": raw_result.get("not_found", False),
-            "error": raw_result.get("error"),
-            "alert_sent": False # antibot.exe has no alert system
-        }
-        
-        # 3. Logika statusu (taka sama jak wczesniej  ale na podstawie nowych danych)
-        new_status = "done"
-        notes = "Fetched via " + result["source"]
+            if not p:
+                logger.error(f"[fetch_allegro_data] CRITICAL: ProductInput.id {product_input_id} not found after 3 retries. Task stopping.")
+                return # return success (None) to not block the queue
+            # --- END FIX ---
 
-        if result.get("error"):
-            new_status = "error"
-            notes = f"antibot.exe error: {result['error']}"
-        elif result.get("not_found", False):
-            new_status = "not_found"
-            notes = "Product not found (antibot.exe)"
-        
-        # --- KONIEC INTEGRACJI ANTIBOT.EXE ---
+            import_job_id = p.import_job_id
 
-        # ten blok jest na wypadek gdybysmy kiedys wrocili do scrapera
-        # ktory SAM wysyla alerty (na razie jest wylaczony)
-        if (
-            new_status == "error"
-            and result["source"] == "failed" 
-            and result.get("error")
-            and not result.get("alert_sent")
-        ):
-            send_scraper_alert(
-                "allegro_scrape_failed",
-                {"ean": ean, "error": result["error"]},
-            )
+            cache = db.query(models.AllegroCache).filter(models.AllegroCache.ean == ean).first()
+            ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
 
-        if not cache:
-            cache = models.AllegroCache(ean=ean)
-            db.add(cache)
-        
-        cache.lowest_price = result["lowest_price"]
-        cache.sold_count = result["sold_count"]
-        cache.source = result["source"]
-        cache.fetched_at = result["fetched_at"]
-        cache.not_found = result.get("not_found", False)
-
-        p.status = new_status
-        p.notes = notes
-
-        db.commit()
-        finalize_job_if_complete(db, import_job_id)
-
-    except Exception as e:
-        db.rollback()
-        # proba zapisu bledu przy produkcie
-        p_error = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
-        if p_error:
-            p_error.status = "error"
-            p_error.notes = f"Błąd krytyczny workera: {e}"
-            import_job_id = p_error.import_job_id
+            if cache and cache.fetched_at > ttl_limit:
+                if cache.source not in ['failed', 'error', 'ban_detected', 'captcha_detected']:
+                    if cache.not_found:
+                        p.status = "not_found"
+                        p.notes = f"Cached not_found @ {cache.fetched_at.date()}"
+                    else:
+                        p.status = "done"
+                        p.notes = f"Cached data @ {cache.fetched_at.date()}"
+                    db.commit()
+                    # musimy wywolac finalize rowniez dla cache'u
+                    finalize_job_if_complete(import_job_id) # ZMIANA: Wywolujemy bez sesji
+                    return 
+                
+            p.status = "processing"
             db.commit()
-            finalize_job_if_complete(db, import_job_id)
-    finally:
-        db.close()
+
+            # --- POCZATEK INTEGRACJI ANTIBOT.EXE ---
+        
+            # 1. Wywolaj nowa funkcje zamiast scraper_fetch
+            raw_result = fetch_with_antibot(ean)
+            
+            # 2. Zmapuj wynik z antibot.exe na format 'result'  ktorego oczekuje reszta zadania
+            try:
+                # proba parsowania daty z isoformatu
+                fetched_at_dt = datetime.fromisoformat(raw_result["last_checked_at"])
+            except (ValueError, TypeError, KeyError):
+                fetched_at_dt = datetime.now(timezone.utc) # fallback
+
+            result = {
+                "lowest_price": raw_result.get("allegro_lowest_price"),
+                "sold_count": raw_result.get("sold_count"),
+                "source": raw_result.get("source", "antibot_exe"),
+                "fetched_at": fetched_at_dt,
+                "not_found": raw_result.get("not_found", False),
+                "error": raw_result.get("error"),
+                "alert_sent": False # antibot.exe has no alert system
+            }
+            
+            # 3. Logika statusu (taka sama jak wczesniej  ale na podstawie nowych danych)
+            new_status = "done"
+            notes = "Fetched via " + result["source"]
+
+            if result.get("error"):
+                new_status = "error"
+                notes = f"antibot.exe error: {result['error']}"
+            elif result.get("not_found", False):
+                new_status = "not_found"
+                notes = "Product not found (antibot.exe)"
+            
+            # --- KONIEC INTEGRACJI ANTIBOT.EXE ---
+
+            # ten blok jest na wypadek gdybysmy kiedys wrocili do scrapera
+            # ktory SAM wysyla alerty (na razie jest wylaczony)
+            if (
+                new_status == "error"
+                and result["source"] == "failed" 
+                and result.get("error")
+                and not result.get("alert_sent")
+            ):
+                send_scraper_alert(
+                    "allegro_scrape_failed",
+                    {"ean": ean, "error": result["error"]},
+                )
+
+            if not cache:
+                cache = models.AllegroCache(ean=ean)
+                db.add(cache)
+            
+            cache.lowest_price = result["lowest_price"]
+            cache.sold_count = result["sold_count"]
+            cache.source = result["source"]
+            cache.fetched_at = result["fetched_at"]
+            cache.not_found = result.get("not_found", False)
+
+            p.status = new_status
+            p.notes = notes
+
+            db.commit()
+            finalize_job_if_complete(import_job_id) # ZMIANA: Wywolujemy bez sesji
+
+        except Exception as e:
+            db.rollback()
+            # proba zapisu bledu przy produkcie
+            # ZMIANA: musimy uzyc nowej sesji zeby odczytac po rollbacku
+            with SessionLocal() as error_db:
+                p_error = error_db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
+                if p_error:
+                    p_error.status = "error"
+                    p_error.notes = f"Błąd krytyczny workera: {e}"
+                    import_job_id = p_error.import_job_id
+                    error_db.commit()
+                    # Wywolanie finalize musi byc POZA sesja error_db
+                    finalize_job_if_complete(import_job_id) # ZMIANA: Wywolujemy bez sesji
+            
+            # ponowne wywolanie bledu zeby celery sprobowal ponowic
+            raise e
+            
+        # ZMIANA: 'finally' jest juz niepotrzebne, bo 'with SessionLocal()' samo zamyka sesje

@@ -19,8 +19,9 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir python-dotenv alembic psycopg2-binary
 
 # Krok 3: Kopiowanie i nadanie uprawnien dla antibot.exe
-COPY antibot.exe /app/antibot.exe
-RUN chmod +x /app/antibot.exe
+# ZMIANA: kopiujemy do /usr/local/bin/ zeby nie bylo konfliktu z volume
+COPY antibot.exe /usr/local/bin/antibot
+RUN chmod +x /usr/local/bin/antibot
   
 # kopiowanie kodu
 COPY ./app ./app
