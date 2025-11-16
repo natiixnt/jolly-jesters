@@ -20,7 +20,7 @@ class ImportJobResponse(ImportJobBase):
     created_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True # POPRAWKA: 'orm_mode' -> 'from_attributes'
 
 # -----------------------
 # Endpoint start import
@@ -63,7 +63,7 @@ class ProductInputResponse(ProductInputBase):
     created_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True # POPRAWKA: 'orm_mode' -> 'from_attributes'
 
 # -----------------------
 # Allegro cache
@@ -86,7 +86,7 @@ class AllegroCacheResponse(AllegroCacheBase):
     not_found: bool
 
     class Config:
-        orm_mode = True
+        from_attributes = True # POPRAWKA: 'orm_mode' -> 'from_attributes'
 
 # -----------------------
 # Export
@@ -100,7 +100,7 @@ class ExportResponse(ExportBase):
     created_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True # POPRAWKA: 'orm_mode' -> 'from_attributes'
 
 # -----------------------
 # Raport zbiorczy dla UI
@@ -116,4 +116,4 @@ class ProductAnalysis(BaseModel):
     profit_margin: Optional[float]
     recommendation: Optional[str]  # opłacalny / nieopłacalny / brak danych
     notes: Optional[str]
-    status: Optional[str] = None 
+    status: Optional[str] = None

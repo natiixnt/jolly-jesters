@@ -16,10 +16,10 @@ RUN apt-get update && apt-get install -y \
 RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome-keyring.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
 
-# krok 3: instalacja google chrome i chromedriver (potrzebne dla seleniumbase)
+# krok 3: instalacja google chrome (BEZ CHROMEDRIVER)
 RUN apt-get update && apt-get install -y \
     google-chrome-stable \
-    chromedriver \
+    # chromedriver usuniety - seleniumbase zarzadza nim sam
     # dodajemy zaleznosci, ktorych moze brakowac w slim
     libvulkan1 \
     libnss3 \
