@@ -5,29 +5,32 @@ import pandas as pd
 from celery import Celery
 from datetime import datetime, timedelta
 import re
-import subprocess  # <-- antibot
-import ast         # <-- antibot
-import logging     # <-- antibot / logging
-from datetime import timezone # <-- antibot
-import time        # <-- race condition fix
+# --- START ZMIAN: Importy SeleniumBase ---
+import logging
+from datetime import timezone
+import time
+import json
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from seleniumbase import Driver
+# --- KONIEC ZMIAN: Importy SeleniumBase ---
 
 from kombu import Queue
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-# ZMIANA: Importujemy sygnal bezposrednio
 from celery.signals import worker_process_init
-# ZMIANA: Importujemy tylko to, co potrzebne, zeby uniknac bledu z forkiem
 from .database import SessionLocal, engine 
 
 from . import models
-# usunieto: from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
 from .services.alerts import send_scraper_alert
 from .config import CACHE_TTL_DAYS
 
+# --- Konfiguracja Celery (bez zmian) ---
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 celery = Celery("app.tasks", broker=CELERY_BROKER)
 
-# celery config
 celery.conf.task_default_queue = "celery"
 celery.conf.task_queues = (
     Queue("celery", routing_key="celery"),
@@ -40,11 +43,10 @@ celery.conf.task_routes = {
     }
 }
 celery.conf.worker_prefetch_multiplier = 1
+# --- Koniec konfiguracji Celery ---
 
-# --- START POPRAWKI: Unikanie bledu Celery/SQLAlchemy fork ---
-# https://docs.celeryq.dev/en/stable/userguide/tasks.html#database-sessions
-# zamykamy polaczenia engine po forku  zeby workery mialy swieze
-# ZMIANA: Uzywamy importowanego sygnalu, a nie obiektu 'celery'
+
+# --- Poprawka SQLAlchemy/Celery (bez zmian) ---
 @worker_process_init.connect
 def init_db_connection(**kwargs):
     logger.info("Initializing DB connection for worker process...")
@@ -61,27 +63,20 @@ def with_db_session(func):
         except Exception as e:
             db.rollback()
             logger.error(f"Task failed, rolling back session. Error: {e}")
-            # ponowne wywolanie bledu  zeby celery zarejestrowal jako 'failure'
             raise e
         finally:
             db.close()
     return wrapper
-# --- KONIEC POPRAWKI ---
+# --- Koniec Poprawki SQLAlchemy ---
 
 
+# --- Funkcje pomocnicze (bez zmian) ---
 def update_job_error(db: Session, job: models.ImportJob, message: str):
-    """Pomocnik do aktualizowania statusu błędu w bazie"""
     job.status = "error"
     job.notes = message
-    # usunieto db.commit() - decorator 'with_db_session' sie tym zajmie
-
 ACTIVE_STATUSES = {"pending", "queued", "processing"}
-
-# ZMIANA: Uzywamy decoratora do zarzadzania sesja
 @with_db_session
 def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
-    """Aktualizuje status zadania, jeśli wszystkie produkty zakończyły przetwarzanie."""
-
     remaining = (
         db.query(models.ProductInput)
         .filter(
@@ -90,23 +85,17 @@ def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
         )
         .count()
     )
-
-    if remaining:
-        return
-
+    if remaining: return
     job = (
         db.query(models.ImportJob)
         .filter(models.ImportJob.id == import_job_id)
         .first()
     )
-    if not job:
-        return
-
+    if not job: return
     total_products = (
         db.query(func.count(models.ProductInput.id))
         .filter(models.ProductInput.import_job_id == import_job_id)
-        .scalar()
-        or 0
+        .scalar() or 0
     )
     error_count = (
         db.query(func.count(models.ProductInput.id))
@@ -114,8 +103,7 @@ def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
             models.ProductInput.import_job_id == import_job_id,
             models.ProductInput.status == "error",
         )
-        .scalar()
-        or 0
+        .scalar() or 0
     )
     not_found_count = (
         db.query(func.count(models.ProductInput.id))
@@ -123,10 +111,8 @@ def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
             models.ProductInput.import_job_id == import_job_id,
             models.ProductInput.status == "not_found",
         )
-        .scalar()
-        or 0
+        .scalar() or 0
     )
-
     if total_products == 0:
         job.status = "error"
         job.notes = "Brak produktów po przetwarzaniu."
@@ -143,30 +129,21 @@ def finalize_job_if_complete(db: Session, import_job_id: int) -> None:
             job.notes = f"Zakończono. Nie znaleziono: {not_found_count}/{total_products}."
         else:
             job.notes = None
-    # usunieto db.commit()
-
-# --- Funkcje pomocnicze do analizy (bez zmian) ---
-
 def find_header_row(df_head):
     ean_keys = ['ean', 'barcode', 'kod']
     name_keys = ['name', 'nazwa', 'title', 'tytuł']
     price_keys = ['price', 'cena', 'cost', 'koszt', 'netto']
-    
     for i, row in df_head.iterrows():
         cols_str = " ".join([str(c).lower() for c in row if pd.notna(c)])
         has_ean = any(key in cols_str for key in ean_keys)
         has_name = any(key in cols_str for key in name_keys)
         has_price = any(key in cols_str for key in price_keys)
-        
         if (has_ean and has_price) or (has_name and has_price) or (has_ean and has_name):
             return i 
-            
     return 0 
-
 def is_ean(val):
     s = str(val).strip()
     return s.isdigit() and len(s) in [8, 12, 13]
-
 def is_price(val):
     if val is None: return False
     s = str(val).strip().replace(',', '.')
@@ -177,21 +154,16 @@ def is_price(val):
         except ValueError:
             return False
     return False
-
 def find_columns_by_content(df, start_row):
     ean_col, name_col, price_col = None, None, None
     potential_cols = {} 
-    
     sample_df = df.iloc[start_row : start_row + 50]
-    
     for _, row in sample_df.iterrows():
         for col_idx, cell in enumerate(row.head(10)):
             if col_idx not in potential_cols:
                 potential_cols[col_idx] = {'ean_count': 0, 'price_count': 0, 'text_count': 0}
-            
             if pd.isna(cell) or str(cell).strip() == "":
                 continue
-                
             if is_ean(cell):
                 potential_cols[col_idx]['ean_count'] += 1
             if is_price(cell):
@@ -201,99 +173,129 @@ def find_columns_by_content(df, start_row):
                 not is_price(cell) and 
                 len(cell) > 3):
                 potential_cols[col_idx]['text_count'] += 1
-
     best_ean = sorted(potential_cols.items(), key=lambda item: item[1]['ean_count'], reverse=True)
     if best_ean and best_ean[0][1]['ean_count'] > 5:
         ean_col = best_ean[0][0]
-
     best_price = sorted(potential_cols.items(), key=lambda item: item[1]['price_count'], reverse=True)
     for idx, counts in best_price:
         if idx != ean_col and counts['price_count'] > 5:
             price_col = idx
             break
-            
     best_name = sorted(potential_cols.items(), key=lambda item: item[1]['text_count'], reverse=True)
     for idx, counts in best_name:
         if idx != ean_col and idx != price_col and counts['text_count'] > 5:
             name_col = idx
             break
-            
     return ean_col, name_col, price_col
-
 # --- Koniec funkcji pomocniczych ---
 
 
-# --- POCZATEK: Funkcja pomocnicza Antibot ---
+# --- POCZATEK: NOWA funkcja scrapujaca (SeleniumBase) ---
 logger = logging.getLogger(__name__) # get logger
 
-def fetch_with_antibot(ean: str) -> dict:
+def fetch_with_seleniumbase(ean: str) -> dict:
     """
-    calls antibot.exe for a single EAN and parses the result
+    scrapes allegro using seleniumbase for a single EAN
+    based on the script provided by the user
     """
-    logger.info(f"[Antibot] running for EAN: {ean}")
+    logger.info(f"[SeleniumBase] running for EAN: {ean}")
     
+    # initialize driver
+    # uc=True -> undetected chromedriver
+    # headless=True -> run without GUI (necessary for docker)
+    driver = None
     try:
-        # assume antibot.exe is in /usr/local/bin/
-        process = subprocess.Popen(
-            ["/usr/local/bin/antibot", ean], # POPRAWKA: sciezka do pliku
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8' # explicit encoding
+        driver = Driver(uc=True, headless=True)
+        driver.maximize_window()
+        driver.get(f'https://allegro.pl/listing?string={ean}')
+        
+        # 1. get data from listing page
+        script_tag = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'script[data-serialize-box-id="EHg7vYMJTQ275owpOcr4Lg=="]')
+            )
         )
+        strData = script_tag.get_attribute("innerHTML")
+        data = json.loads(strData)
 
-        product_detail = None
-        raw_logs = []
+        sold = None
+        price = None
+        minPrice = None
 
-        for line in process.stdout:
-            line = line.strip()
-            if not line:
-                continue
+        # iterate through products on listing page
+        for item in data["__listing_StoreState"]["items"]["elements"]:
+            try:
+                # '10 osob kupilo' -> 10
+                sold_str = item['productPopularity']['label'].split(' ')[0]
+                sold = int(sold_str)
+            except Exception:
+                pass # keep previous value if any
+
+            try:
+                price_str = item['price']['mainPrice']['amount']
+                price = float(price_str)
+            except Exception:
+                pass # keep previous value if any
+
+            # find the minimum price from all listings
+            if price is not None:
+                if minPrice is None or price < minPrice:
+                    minPrice = price
+
+        # 2. validation step: go to product page and check EAN
+        pein = None # ean from product page
+        try:
+            # click the first product title to go to product page
+            title = driver.find_element(By.CSS_SELECTOR, '.mgn2_14.m9qz_yp')
+            title.click()
+            time.sleep(2) # wait for potential redirects
             
-            raw_logs.append(line)
-            logger.debug(f"[Antibot] LOG: {line}")
-            
-            if 'Product detail: ' in line:
-                product_detail_str = line.split('Product detail: ')[1].strip()
-                try:
-                    product_detail = ast.literal_eval(product_detail_str)
-                    logger.info(f"[Antibot] parse success for EAN: {ean}")
-                    break # found data  no need to read more
-                except Exception as e:
-                    logger.error(f"[Antibot] ast.literal_eval error for EAN {ean}: {e} | Line: {product_detail_str}")
-            
-        process.wait()
+            # find the EAN meta tag on the product page
+            script_tag = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, 'meta[itemprop="gtin"]')
+                )
+            )
+            pein = script_tag.get_attribute("content")
+        except Exception as e:
+            logger.warning(f"[SeleniumBase] EAN validation step failed for {ean}: {e}")
+            pass # could not validate ean
 
-        if product_detail:
-            # make sure output data contains all expected fields
-            product_detail.setdefault('not_found', False)
-            product_detail.setdefault('source', 'antibot_exe')
-            product_detail.setdefault('last_checked_at', datetime.now(timezone.utc).isoformat())
-            product_detail.setdefault('allegro_lowest_price', None)
-            product_detail.setdefault('sold_count', None)
-            return product_detail
+        # 3. final check
+        notFound = False
+        if (minPrice is None and sold is None):
+            # if we found no price and no sold count  assume not found
+            notFound = True
+        elif pein is not None and pein != ean:
+            # validation failed - the product found is not the one we searched for
+            logger.warning(f"[SeleniumBase] EAN mismatch! Searched for {ean}, but found {pein}")
+            notFound = True
 
-        # if we got here  process finished but did not return 'Product detail: '
-        logger.warning(f"[Antibot] 'Product detail:' not found for EAN {ean}. Return code: {process.returncode}")
-        logger.warning(f"[Antibot] Full logs for EAN {ean}: {' '.join(raw_logs)}")
+        if notFound:
+            sold = None
+            minPrice = None
 
-        return {
+        detail = {
             "ean": ean,
-            "allegro_lowest_price": None,
-            "sold_count": None,
+            "allegro_lowest_price": minPrice,
+            "sold_count": sold,
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
-            "source": "antibot_exe",
-            "not_found": True, # treat no data as "not_found"
-            "error": "No 'Product detail:' line in output"
+            "source": "seleniumbase_scrape",
+            "not_found": notFound
         }
+        logger.info(f"[SeleniumBase] result for EAN {ean}: {detail}")
+        return detail
 
-    except FileNotFoundError:
-        logger.critical(f"[Antibot] File /usr/local/bin/antibot not found!") # POPRAWKA: sciezka w logu
-        return {"ean": ean, "source": "antibot_error", "not_found": True, "error": "antibot.exe not found", "last_checked_at": datetime.now(timezone.utc).isoformat()}
+    except TimeoutException:
+        logger.error(f"[SeleniumBase] Timeout waiting for Allegro page for EAN {ean}")
+        return {"ean": ean, "source": "selenium_timeout", "not_found": True, "error": "TimeoutException", "last_checked_at": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
-        logger.error(f"[Antibot] Critical subprocess error for EAN {ean}: {e}")
-        return {"ean": ean, "source": "antibot_error", "not_found": True, "error": str(e), "last_checked_at": datetime.now(timezone.utc).isoformat()}
-# --- KONIEC: Funkcja pomocnicza Antibot ---
+        logger.error(f"[SeleniumBase] Critical subprocess error for EAN {ean}: {e}")
+        return {"ean": ean, "source": "selenium_error", "not_found": True, "error": str(e), "last_checked_at": datetime.now(timezone.utc).isoformat()}
+    finally:
+        if driver:
+            driver.quit() # always close the browser
+# --- KONIEC: NOWA funkcja scrapujaca ---
 
 
 @celery.task(bind=True, acks_late=True, max_retries=3)
@@ -301,13 +303,11 @@ def parse_import_file(self, import_job_id: int, filepath: str):
     """
     Krok 1: Parsuje wgrany plik, tworzy ProductInput i kolejkuje zadania fetch_allegro_data
     """
-    # ZMIANA: Uzywamy 'with' dla sesji, zeby miec pewnosc zamkniecia
     db = SessionLocal()
     try:
         job = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
         if not job:
-            return # job nie istnieje
-
+            return 
         job.status = "processing"
         job.notes = None
         db.commit()
@@ -355,8 +355,6 @@ def parse_import_file(self, import_job_id: int, filepath: str):
         
         if missing_cols:
              raise ValueError(f"Nie znaleziono wymaganych kolumn zawierających słowa: {', '.join(missing_cols)}")
-
-        # usunieto: bledny blok 'if not df.is_copy:'
         
         df.loc[:, "ean_norm"] = df[ean_col].astype(str).str.strip().str.lstrip('0')
         df.loc[:, "name_norm"] = df[name_col].astype(str).str.strip()
@@ -397,7 +395,6 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             for product_id, product_ean in task_payloads:
                 fetch_allegro_data.delay(product_id, product_ean)
         except Exception as exc:
-            # ZMIANA: Jesli kolejkowanie sie nie uda, uzyj biezacej sesji 'db'
             job.status = "error"
             job.notes = f"Nie udało się zlecić zadań scrapera: {exc}"
             db.commit()
@@ -405,15 +402,14 @@ def parse_import_file(self, import_job_id: int, filepath: str):
 
     except (ValueError, Exception) as e:
         db.rollback()
-        # ZMIANA: Uzyj biezacej sesji 'db' do zapisu bledu
         job_to_update = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
         if job_to_update:
             update_job_error(db, job_to_update, str(e))
-            db.commit() # commit po update_job_error
+            db.commit() 
         
         raise e 
     finally:
-        db.close() # Zawsze zamykaj sesje na koniec
+        db.close() 
 
 
 @celery.task(bind=True, acks_late=True, max_retries=3)
@@ -421,7 +417,6 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
     """
     Krok 2: Pobiera dane z Allegro (z logiką cache)
     """
-    # ZMIANA: Uzywamy 'with' dla sesji
     with SessionLocal() as db:
         try:
             # --- START FIX: Race condition read-after-write ---
@@ -435,19 +430,17 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
 
             if not p:
                 logger.error(f"[fetch_allegro_data] CRITICAL: ProductInput.id {product_input_id} not found after 3 retries. Task stopping.")
-                return # return success (None) to not block the queue
+                return 
             # --- END FIX ---
 
             import_job_id = p.import_job_id
-
             cache = db.query(models.AllegroCache).filter(models.AllegroCache.ean == ean).first()
             ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
 
             if cache and cache.fetched_at > ttl_limit:
                 
-                # --- POPRAWKA LOGIKI CACHE ---
-                # nie uzywaj cache'u jesli poprzedni wynik byl bledem
-                INVALID_CACHE_SOURCES = ['failed', 'error', 'ban_detected', 'captcha_detected', 'antibot_error']
+                # --- POPRAWKA LOGIKI CACHE (dla selenium) ---
+                INVALID_CACHE_SOURCES = ['failed', 'error', 'ban_detected', 'captcha_detected', 'antibot_error', 'selenium_error', 'selenium_timeout']
                 if cache.source not in INVALID_CACHE_SOURCES:
                 # --- KONIEC POPRAWKI LOGIKI CACHE ---
                 
@@ -458,47 +451,41 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
                         p.status = "done"
                         p.notes = f"Cached data @ {cache.fetched_at.date()}"
                     db.commit()
-                    # musimy wywolac finalize rowniez dla cache'u
-                    finalize_job_if_complete(import_job_id) # ZMIANA: Wywolujemy bez sesji
+                    finalize_job_if_complete(import_job_id) 
                     return 
                 
             p.status = "processing"
             db.commit()
 
-            # --- POCZATEK INTEGRACJI ANTIBOT.EXE ---
-        
-            # 1. Wywolaj nowa funkcje zamiast scraper_fetch
-            raw_result = fetch_with_antibot(ean)
+            # --- ZMIANA: Wywolanie SeleniumBase ---
+            raw_result = fetch_with_seleniumbase(ean)
             
-            # 2. Zmapuj wynik z antibot.exe na format 'result'  ktorego oczekuje reszta zadania
             try:
-                # proba parsowania daty z isoformatu
                 fetched_at_dt = datetime.fromisoformat(raw_result["last_checked_at"])
             except (ValueError, TypeError, KeyError):
-                fetched_at_dt = datetime.now(timezone.utc) # fallback
+                fetched_at_dt = datetime.now(timezone.utc) 
 
             result = {
                 "lowest_price": raw_result.get("allegro_lowest_price"),
                 "sold_count": raw_result.get("sold_count"),
-                "source": raw_result.get("source", "antibot_exe"),
+                "source": raw_result.get("source", "seleniumbase_scrape"),
                 "fetched_at": fetched_at_dt,
                 "not_found": raw_result.get("not_found", False),
                 "error": raw_result.get("error"),
-                "alert_sent": False # antibot.exe has no alert system
+                "alert_sent": False # seleniumbase has no alert system
             }
             
-            # 3. Logika statusu (taka sama jak wczesniej  ale na podstawie nowych danych)
             new_status = "done"
             notes = "Fetched via " + result["source"]
 
             if result.get("error"):
                 new_status = "error"
-                notes = f"antibot.exe error: {result['error']}"
+                notes = f"seleniumbase error: {result['error']}"
             elif result.get("not_found", False):
                 new_status = "not_found"
-                notes = "Product not found (antibot.exe)"
+                notes = "Product not found (seleniumbase)"
             
-            # --- KONIEC INTEGRACJI ANTIBOT.EXE ---
+            # --- KONIEC ZMIANY ---
 
             # ten blok jest na wypadek gdybysmy kiedys wrocili do scrapera
             # ktory SAM wysyla alerty (na razie jest wylaczony)
@@ -527,23 +514,17 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
             p.notes = notes
 
             db.commit()
-            finalize_job_if_complete(import_job_id) # ZMIANA: Wywolujemy bez sesji
+            finalize_job_if_complete(import_job_id) 
 
         except Exception as e:
             db.rollback()
-            # proba zapisu bledu przy produkcie
-            # ZMIANA: musimy uzyc nowej sesji zeby odczytac po rollbacku
             with SessionLocal() as error_db:
                 p_error = error_db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
                 if p_error:
                     p_error.status = "error"
-                    p_error.notes = f"Błąd krytyczny workera: {e}"
+                    p_error.notes = f"Worker critical error: {e}"
                     import_job_id = p_error.import_job_id
                     error_db.commit()
-                    # Wywolanie finalize musi byc POZA sesja error_db
-                    finalize_job_if_complete(import_job_id) # ZMIANA: Wywolujemy bez sesji
+                    finalize_job_if_complete(import_job_id) 
             
-            # ponowne wywolanie bledu zeby celery sprobowal ponowic
             raise e
-            
-        # ZMIANA: 'finally' jest juz niepotrzebne, bo 'with SessionLocal()' samo zamyka sesje
