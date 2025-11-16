@@ -444,7 +444,13 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
             ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
 
             if cache and cache.fetched_at > ttl_limit:
-                if cache.source not in ['failed', 'error', 'ban_detected', 'captcha_detected']:
+                
+                # --- POPRAWKA LOGIKI CACHE ---
+                # nie uzywaj cache'u jesli poprzedni wynik byl bledem
+                INVALID_CACHE_SOURCES = ['failed', 'error', 'ban_detected', 'captcha_detected', 'antibot_error']
+                if cache.source not in INVALID_CACHE_SOURCES:
+                # --- KONIEC POPRAWKI LOGIKI CACHE ---
+                
                     if cache.not_found:
                         p.status = "not_found"
                         p.notes = f"Cached not_found @ {cache.fetched_at.date()}"
