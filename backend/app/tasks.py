@@ -14,6 +14,8 @@ import time        # <-- race condition fix
 from kombu import Queue
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+# ZMIANA: Importujemy sygnal bezposrednio
+from celery.signals import worker_process_init
 # ZMIANA: Importujemy tylko to, co potrzebne, zeby uniknac bledu z forkiem
 from .database import SessionLocal, engine 
 
@@ -42,7 +44,8 @@ celery.conf.worker_prefetch_multiplier = 1
 # --- START POPRAWKI: Unikanie bledu Celery/SQLAlchemy fork ---
 # https://docs.celeryq.dev/en/stable/userguide/tasks.html#database-sessions
 # zamykamy polaczenia engine po forku  zeby workery mialy swieze
-@celery.signals.worker_process_init.connect
+# ZMIANA: Uzywamy importowanego sygnalu, a nie obiektu 'celery'
+@worker_process_init.connect
 def init_db_connection(**kwargs):
     logger.info("Initializing DB connection for worker process...")
     engine.dispose(close=True)
