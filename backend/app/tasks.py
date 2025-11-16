@@ -353,70 +353,66 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
         p.status = "processing"
         db.commit()
 
-    #
-    p.status = "processing"
-    db.commit()
+        # --- POCZĄTEK INTEGRACJI ANTIBOT.EXE ---
 
-    # --- POCZĄTEK INTEGRACJI ANTIBOT.EXE ---
+        # 1. Wywolaj nowa funkcje zamiast scraper_fetch
+        raw_result = fetch_with_antibot(ean)
 
-    # 1. Wywolaj nowa funkcje zamiast scraper_fetch
-    raw_result = fetch_with_antibot(ean)
+        # 2. Zmapuj wynik z antibot.exe na format 'result'  ktorego oczekuje reszta zadania
+        try:
+            fetched_at_dt = datetime.fromisoformat(raw_result["last_checked_at"])
+        except (ValueError, TypeError):
+            fetched_at_dt = datetime.now(timezone.utc) # fallback
 
-    # 2. Zmapuj wynik z antibot.exe na format 'result'  ktorego oczekuje reszta zadania
-    try:
-        fetched_at_dt = datetime.fromisoformat(raw_result["last_checked_at"])
-    except (ValueError, TypeError):
-        fetched_at_dt = datetime.now(timezone.utc) # fallback
+        result = {
+            "lowest_price": raw_result.get("allegro_lowest_price"),
+            "sold_count": raw_result.get("sold_count"),
+            "source": raw_result.get("source", "antibot_exe"),
+            "fetched_at": fetched_at_dt,
+            "not_found": raw_result.get("not_found", False),
+            "error": raw_result.get("error"),
+            "alert_sent": False # antibot.exe nie ma systemu alertow
+        }
 
-    result = {
-        "lowest_price": raw_result.get("allegro_lowest_price"),
-        "sold_count": raw_result.get("sold_count"),
-        "source": raw_result.get("source", "antibot_exe"),
-        "fetched_at": fetched_at_dt,
-        "not_found": raw_result.get("not_found", False),
-        "error": raw_result.get("error"),
-        "alert_sent": False # antibot.exe nie ma systemu alertow
-    }
+        # 3. Logika statusu (taka sama jak wczesniej  ale na podstawie nowych danych)
+        new_status = "done"
+        notes = "Fetched via " + result["source"]
 
-    # 3. Logika statusu (taka sama jak wczesniej  ale na podstawie nowych danych)
-    new_status = "done"
-    notes = "Fetched via " + result["source"]
+        if result.get("error"):
+            new_status = "error"
+            notes = f"Błąd antibot.exe: {result['error']}"
+        elif result.get("not_found", False):
+            new_status = "not_found"
+            notes = "Product not found (antibot.exe)"
 
-    if result.get("error"):
-        new_status = "error"
-        notes = f"Błąd antibot.exe: {result['error']}"
-    elif result.get("not_found", False):
-        new_status = "not_found"
-        notes = "Product not found (antibot.exe)"
+        # --- KONIEC INTEGRACJI ANTIBOT.EXE ---
 
-    # --- KONIEC INTEGRACJI ANTIBOT.EXE ---
+        if (
+            new_status == "error"
+            and result["source"] == "failed"
+            and result.get("error")
+            and not result.get("alert_sent")
+        ):
+            send_scraper_alert(
+                "allegro_scrape_failed",
+                {"ean": ean, "error": result["error"]},
+            )
 
-    if (
-        new_status == "error"
-        and result["source"] == "failed"
-        and result.get("error")
-        and not result.get("alert_sent")
-    ):
-        send_scraper_alert(
-            "allegro_scrape_failed",
-            {"ean": ean, "error": result["error"]},
-        )
+        if not cache:
+            cache = models.AllegroCache(ean=ean)
+            db.add(cache)
+            
+            cache.lowest_price = result["lowest_price"]
+            cache.sold_count = result["sold_count"]
+            cache.source = result["source"]
+            cache.fetched_at = result["fetched_at"]
+            cache.not_found = result.get("not_found", False)
 
-    if not cache:
-        cache = models.AllegroCache(ean=ean)
-        db.add(cache)
-        
-        cache.lowest_price = result["lowest_price"]
-        cache.sold_count = result["sold_count"]
-        cache.source = result["source"]
-        cache.fetched_at = result["fetched_at"]
-        cache.not_found = result.get("not_found", False)
+            p.status = new_status
+            p.notes = notes
 
-        p.status = new_status
-        p.notes = notes
-
-        db.commit()
-        finalize_job_if_complete(db, import_job_id)
+            db.commit()
+            finalize_job_if_complete(db, import_job_id)
 
     except Exception as e:
         db.rollback()
