@@ -5,6 +5,11 @@ import pandas as pd
 from celery import Celery
 from datetime import datetime, timedelta
 import re
+import subprocess  # <-- antibot
+import ast         # <-- antibot
+import logging     # <-- antibot / logging
+from datetime import timezone # <-- antibot
+import time        # <-- race condition fix
 
 from kombu import Queue
 from sqlalchemy import func
@@ -12,6 +17,7 @@ from sqlalchemy.orm import Session
 from .database import SessionLocal
 
 from . import models
+# from .services.allegro_scraper import fetch_allegro_data as scraper_fetch # <-- USUNIETE (juz niepotrzebne)
 from .services.alerts import send_scraper_alert
 from .config import CACHE_TTL_DAYS
 
@@ -191,6 +197,79 @@ def find_columns_by_content(df, start_row):
 # --- Koniec funkcji pomocniczych ---
 
 
+# --- POCZATEK: Funkcja pomocnicza Antibot ---
+logger = logging.getLogger(__name__) # get logger
+
+def fetch_with_antibot(ean: str) -> dict:
+    """
+    calls antibot.exe for a single EAN and parses the result
+    """
+    logger.info(f"[Antibot] running for EAN: {ean}")
+    
+    try:
+        # assume antibot.exe is in /app/
+        process = subprocess.Popen(
+            ["/app/antibot.exe", ean], # use full path
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8' # explicit encoding
+        )
+
+        product_detail = None
+        raw_logs = []
+
+        for line in process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            
+            raw_logs.append(line)
+            logger.debug(f"[Antibot] LOG: {line}")
+            
+            if 'Product detail: ' in line:
+                product_detail_str = line.split('Product detail: ')[1].strip()
+                try:
+                    product_detail = ast.literal_eval(product_detail_str)
+                    logger.info(f"[Antibot] parse success for EAN: {ean}")
+                    break # found data  no need to read more
+                except Exception as e:
+                    logger.error(f"[Antibot] ast.literal_eval error for EAN {ean}: {e} | Line: {product_detail_str}")
+            
+        process.wait()
+
+        if product_detail:
+            # make sure output data contains all expected fields
+            product_detail.setdefault('not_found', False)
+            product_detail.setdefault('source', 'antibot_exe')
+            product_detail.setdefault('last_checked_at', datetime.now(timezone.utc).isoformat())
+            product_detail.setdefault('allegro_lowest_price', None)
+            product_detail.setdefault('sold_count', None)
+            return product_detail
+
+        # if we got here  process finished but did not return 'Product detail: '
+        logger.warning(f"[Antibot] 'Product detail:' not found for EAN {ean}. Return code: {process.returncode}")
+        logger.warning(f"[Antibot] Full logs for EAN {ean}: {' '.join(raw_logs)}")
+
+        return {
+            "ean": ean,
+            "allegro_lowest_price": None,
+            "sold_count": None,
+            "last_checked_at": datetime.now(timezone.utc).isoformat(),
+            "source": "antibot_exe",
+            "not_found": True, # treat no data as "not_found"
+            "error": "No 'Product detail:' line in output"
+        }
+
+    except FileNotFoundError:
+        logger.critical(f"[Antibot] File /app/antibot.exe not found!")
+        return {"ean": ean, "source": "antibot_error", "not_found": True, "error": "antibot.exe not found", "last_checked_at": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        logger.error(f"[Antibot] Critical subprocess error for EAN {ean}: {e}")
+        return {"ean": ean, "source": "antibot_error", "not_found": True, "error": str(e), "last_checked_at": datetime.now(timezone.utc).isoformat()}
+# --- KONIEC: Funkcja pomocnicza Antibot ---
+
+
 @celery.task(bind=True, acks_late=True, max_retries=3)
 def parse_import_file(self, import_job_id: int, filepath: str):
     """
@@ -328,10 +407,22 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
     """
     db = SessionLocal()
     try:
-        p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
+        # --- START FIX: Race condition read-after-write ---
+        # sometimes the worker picks up the task before the parse_import_file transaction commits
+        # we give it a moment to try and find the product
+        p = None
+        for _ in range(3): # try 3 times
+            p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
+            if p:
+                break # found it
+            logger.warning(f"[fetch_allegro_data] ProductInput.id {product_input_id} not found (race condition?), retrying in 0.5s...")
+            time.sleep(0.5)
+
         if not p:
+            logger.error(f"[fetch_allegro_data] CRITICAL: ProductInput.id {product_input_id} not found after 3 retries. Task stopping.")
             db.close()
-            return
+            return # return success (None) to not block the queue
+        # --- END FIX ---
 
         import_job_id = p.import_job_id
 
@@ -347,21 +438,24 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
                     p.status = "done"
                     p.notes = f"Cached data @ {cache.fetched_at.date()}"
                 db.commit()
+                # musimy wywolac finalize rowniez dla cache'u
+                finalize_job_if_complete(db, import_job_id)
                 db.close()
                 return 
             
         p.status = "processing"
         db.commit()
 
-        # --- POCZĄTEK INTEGRACJI ANTIBOT.EXE ---
-
+        # --- POCZATEK INTEGRACJI ANTIBOT.EXE ---
+    
         # 1. Wywolaj nowa funkcje zamiast scraper_fetch
         raw_result = fetch_with_antibot(ean)
-
+        
         # 2. Zmapuj wynik z antibot.exe na format 'result'  ktorego oczekuje reszta zadania
         try:
+            # proba parsowania daty z isoformatu
             fetched_at_dt = datetime.fromisoformat(raw_result["last_checked_at"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, KeyError):
             fetched_at_dt = datetime.now(timezone.utc) # fallback
 
         result = {
@@ -371,25 +465,27 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
             "fetched_at": fetched_at_dt,
             "not_found": raw_result.get("not_found", False),
             "error": raw_result.get("error"),
-            "alert_sent": False # antibot.exe nie ma systemu alertow
+            "alert_sent": False # antibot.exe has no alert system
         }
-
+        
         # 3. Logika statusu (taka sama jak wczesniej  ale na podstawie nowych danych)
         new_status = "done"
         notes = "Fetched via " + result["source"]
 
         if result.get("error"):
             new_status = "error"
-            notes = f"Błąd antibot.exe: {result['error']}"
+            notes = f"antibot.exe error: {result['error']}"
         elif result.get("not_found", False):
             new_status = "not_found"
             notes = "Product not found (antibot.exe)"
-
+        
         # --- KONIEC INTEGRACJI ANTIBOT.EXE ---
 
+        # ten blok jest na wypadek gdybysmy kiedys wrocili do scrapera
+        # ktory SAM wysyla alerty (na razie jest wylaczony)
         if (
             new_status == "error"
-            and result["source"] == "failed"
+            and result["source"] == "failed" 
             and result.get("error")
             and not result.get("alert_sent")
         ):
@@ -401,26 +497,27 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
         if not cache:
             cache = models.AllegroCache(ean=ean)
             db.add(cache)
-            
-            cache.lowest_price = result["lowest_price"]
-            cache.sold_count = result["sold_count"]
-            cache.source = result["source"]
-            cache.fetched_at = result["fetched_at"]
-            cache.not_found = result.get("not_found", False)
+        
+        cache.lowest_price = result["lowest_price"]
+        cache.sold_count = result["sold_count"]
+        cache.source = result["source"]
+        cache.fetched_at = result["fetched_at"]
+        cache.not_found = result.get("not_found", False)
 
-            p.status = new_status
-            p.notes = notes
+        p.status = new_status
+        p.notes = notes
 
-            db.commit()
-            finalize_job_if_complete(db, import_job_id)
+        db.commit()
+        finalize_job_if_complete(db, import_job_id)
 
     except Exception as e:
         db.rollback()
-        p = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
-        if p:
-            p.status = "error"
-            p.notes = f"Błąd krytyczny workera: {e}"
-            import_job_id = p.import_job_id
+        # proba zapisu bledu przy produkcie
+        p_error = db.query(models.ProductInput).filter(models.ProductInput.id == product_input_id).first()
+        if p_error:
+            p_error.status = "error"
+            p_error.notes = f"Błąd krytyczny workera: {e}"
+            import_job_id = p_error.import_job_id
             db.commit()
             finalize_job_if_complete(db, import_job_id)
     finally:
