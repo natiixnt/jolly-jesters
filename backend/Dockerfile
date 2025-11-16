@@ -33,6 +33,10 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir python-dotenv alembic psycopg2-binary
 
+COPY antibot.exe /app/antibot.exe
+RUN chmod +x /app/antibot.exe
+  
+
 # kopiowanie kodu
 COPY ./app ./app
 

@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 from .database import SessionLocal
 
 from . import models
-from .services.allegro_scraper import fetch_allegro_data as scraper_fetch
 from .services.alerts import send_scraper_alert
 from .config import CACHE_TTL_DAYS
 
@@ -354,39 +353,58 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
         p.status = "processing"
         db.commit()
 
-        result = scraper_fetch(ean)
+    #
+    p.status = "processing"
+    db.commit()
 
-        new_status = "done"
-        notes = "Fetched via " + result["source"]
+    # --- POCZĄTEK INTEGRACJI ANTIBOT.EXE ---
 
-        if result["source"] in ["failed", "ban_detected", "captcha_detected"]:
-            new_status = "error"
-            if result["source"] == "ban_detected":
-                notes = "Scraping blocked by Allegro"
-            elif result["source"] == "captcha_detected":
-                notes = "Scraping interrupted by CAPTCHA"
-            else:
-                notes = "Scraping failed"
-            if result.get("error"):
-                notes += f" ({result['error']})"
-        elif result.get("not_found", False):
-            new_status = "not_found"
-            notes = "Product not found"
+    # 1. Wywolaj nowa funkcje zamiast scraper_fetch
+    raw_result = fetch_with_antibot(ean)
 
-        if (
-            new_status == "error"
-            and result["source"] == "failed"
-            and result.get("error")
-            and not result.get("alert_sent")
-        ):
-            send_scraper_alert(
-                "allegro_scrape_failed",
-                {"ean": ean, "error": result["error"]},
-            )
+    # 2. Zmapuj wynik z antibot.exe na format 'result'  ktorego oczekuje reszta zadania
+    try:
+        fetched_at_dt = datetime.fromisoformat(raw_result["last_checked_at"])
+    except (ValueError, TypeError):
+        fetched_at_dt = datetime.now(timezone.utc) # fallback
 
-        if not cache:
-            cache = models.AllegroCache(ean=ean)
-            db.add(cache)
+    result = {
+        "lowest_price": raw_result.get("allegro_lowest_price"),
+        "sold_count": raw_result.get("sold_count"),
+        "source": raw_result.get("source", "antibot_exe"),
+        "fetched_at": fetched_at_dt,
+        "not_found": raw_result.get("not_found", False),
+        "error": raw_result.get("error"),
+        "alert_sent": False # antibot.exe nie ma systemu alertow
+    }
+
+    # 3. Logika statusu (taka sama jak wczesniej  ale na podstawie nowych danych)
+    new_status = "done"
+    notes = "Fetched via " + result["source"]
+
+    if result.get("error"):
+        new_status = "error"
+        notes = f"Błąd antibot.exe: {result['error']}"
+    elif result.get("not_found", False):
+        new_status = "not_found"
+        notes = "Product not found (antibot.exe)"
+
+    # --- KONIEC INTEGRACJI ANTIBOT.EXE ---
+
+    if (
+        new_status == "error"
+        and result["source"] == "failed"
+        and result.get("error")
+        and not result.get("alert_sent")
+    ):
+        send_scraper_alert(
+            "allegro_scrape_failed",
+            {"ean": ean, "error": result["error"]},
+        )
+
+    if not cache:
+        cache = models.AllegroCache(ean=ean)
+        db.add(cache)
         
         cache.lowest_price = result["lowest_price"]
         cache.sold_count = result["sold_count"]

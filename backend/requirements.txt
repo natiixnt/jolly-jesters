@@ -9,11 +9,8 @@ celery[redis]
 redis
 python-dotenv
 requests
-beautifulsoup4
 openpyxl
 pydantic
 uvicorn
 python-multipart
-httpx
--e ./vendor/httpx-impersonate/
 blinker==1.6.2
