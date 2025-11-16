@@ -80,7 +80,7 @@ services:
     volumes:
       - ./backend:/app
       - workspace_data:/workspace
-    shm_size: 2g # potrzebne dla selenium/chrome
+    shm_size: 2gb # potrzebne dla selenium/chrome
     environment:
       - WORKSPACE=/workspace
       # reszta (CELERY_BROKER_URL, DATABASE_URL) jest juz w .env
