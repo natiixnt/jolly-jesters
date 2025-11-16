@@ -72,16 +72,18 @@ services:
     build:
       context: ./backend
     container_name: pilot_scraper_worker
+    # --- POPRAWKA: dodalem env_file zeby wczytac proxy ---
+    env_file:
+      - ./backend/.env
     command: >
       sh -c "celery -A app.tasks worker --loglevel=info --queues scraper --concurrency=1"
     volumes:
       - ./backend:/app
       - workspace_data:/workspace
-    shm_size: 2g # <-- DODANE PONOWNIE, potrzebne dla selenium/chrome
+    shm_size: 2g # potrzebne dla selenium/chrome
     environment:
       - WORKSPACE=/workspace
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - DATABASE_URL=postgresql+psycopg2://pilot:pilot@postgres:5432/pilotdb
+      # reszta (CELERY_BROKER_URL, DATABASE_URL) jest juz w .env
     dns:
       - 8.8.8.8
     depends_on:
