@@ -25,7 +25,8 @@ from .database import SessionLocal, engine
 
 from . import models
 from .services.alerts import send_scraper_alert
-from .config import CACHE_TTL_DAYS
+# --- ZMIANA: Importujemy tez zmienne proxy ---
+from .config import CACHE_TTL_DAYS, PROXY_URL, PROXY_USERNAME, PROXY_PASSWORD
 
 # --- Konfiguracja Celery (bez zmian) ---
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
@@ -200,12 +201,24 @@ def fetch_with_seleniumbase(ean: str) -> dict:
     """
     logger.info(f"[SeleniumBase] running for EAN: {ean}")
     
-    # initialize driver
-    # uc=True -> undetected chromedriver
-    # headless=True -> run without GUI (necessary for docker)
+    # --- START POPRAWKI PROXY ---
+    proxy_string = None
+    if PROXY_URL:
+        if PROXY_USERNAME and PROXY_PASSWORD:
+            # format: user:pass@host:port
+            # seleniumbase oczekuje hosta bez http://
+            proxy_host = PROXY_URL.replace("http://", "").replace("https://", "")
+            proxy_string = f"{PROXY_USERNAME}:{PROXY_PASSWORD}@{proxy_host}"
+        else:
+            proxy_string = PROXY_URL # zaklada format host:port
+        
+        logger.info(f"[SeleniumBase] using proxy: {proxy_string.split('@')[-1]}") # loguj tylko hosta
+    # --- KONIEC POPRAWKI PROXY ---
+
     driver = None
     try:
-        driver = Driver(uc=True, headless=True)
+        # ZMIANA: Przekazanie proxy do Drivera
+        driver = Driver(uc=True, headless=True, proxy=proxy_string) 
         driver.maximize_window()
         driver.get(f'https://allegro.pl/listing?string={ean}')
         
