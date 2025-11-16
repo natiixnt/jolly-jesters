@@ -1,5 +1,5 @@
 # Plik: docker-compose.yml
-version: "3.9"
+# usunieto 'version: "3.9"' (przestarzale)
 
 services:
   postgres:
@@ -72,24 +72,26 @@ services:
     build:
       context: ./backend
     container_name: pilot_scraper_worker
+    # command:
+    # ustawilem concurrency na 1 dla bezpieczenstwa antibot.exe
+    # mozesz to zwiekszyc, jesli antibot.exe dziala rownolegle
     command: >
-      sh -c "celery -A app.tasks worker --loglevel=info --queues scraper --concurrency=${SCRAPER_WORKER_CONCURRENCY:-4}"
+      sh -c "celery -A app.tasks worker --loglevel=info --queues scraper --concurrency=1"
     volumes:
       - ./backend:/app
       - workspace_data:/workspace
-    shm_size: 2g
+    # usunieto: shm_size: 2g (potrzebne tylko dla przegladarki/httpx)
     environment:
       - WORKSPACE=/workspace
-      - SCRAPER_WORKER_CONCURRENCY=4
       - CELERY_BROKER_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql+psycopg2://pilot:pilot@postgres:5432/pilotdb
-      - SELENIUM_HEADLESS=${SELENIUM_HEADLESS:-0}
+      # usunieto: SELENIUM_HEADLESS i SCRAPER_WORKER_CONCURRENCY
     dns:
-      - 8.8.8.8
+      - 8.8.8.8 # zostawiamy dla dostepu do internetu (dla antibot.exe)
     depends_on:
-      postgres: # <-- POPRAWKA: Dodano warunek 'service_healthy'
+      postgres: 
         condition: service_healthy
-      redis: # <-- POPRAWKA: Dodano warunek 'service_healthy'
+      redis:
         condition: service_healthy
 
   frontend:

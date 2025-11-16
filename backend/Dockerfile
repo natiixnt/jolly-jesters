@@ -1,42 +1,27 @@
-# Używamy pełnego obrazu debian, aby móc zainstalować Chrome
+# Uzywamy obrazu slim, poniewaz nie potrzebujemy juz pelnego debiana dla Chrome
 FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Krok 1: Instalacja podstawowych zależności
+# Krok 1: Instalacja minimalnych zaleznosci (np. git moze byc kiedys potrzebny do pip install)
 RUN apt-get update && apt-get install -y \
     wget \
-    gnupg \
     curl \
     git \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Krok 2: Dodanie repo Google Chrome (poprawna metoda z GPG)
-RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome-keyring.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
-
-# Krok 3: Instalacja Google Chrome i jego zależności
-RUN apt-get update && apt-get install -y \
-    google-chrome-stable \
-    # Dodajemy zależności, których może brakować w slim
-    libvulkan1 \
-    libnss3 \
-    fonts-liberation \
-    --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
-
-# Krok 4: skopiowanie i instalacja zależności Pythona
+# Krok 2: skopiowanie i instalacja zależności Pythona
+# USUNIETO: COPY vendor ./vendor
 COPY requirements.txt .
-COPY vendor ./vendor
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir python-dotenv alembic psycopg2-binary
 
+# Krok 3: Kopiowanie i nadanie uprawnien dla antibot.exe
 COPY antibot.exe /app/antibot.exe
 RUN chmod +x /app/antibot.exe
   
-
 # kopiowanie kodu
 COPY ./app ./app
 
