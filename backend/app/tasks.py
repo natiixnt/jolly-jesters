@@ -214,35 +214,49 @@ def fetch_with_seleniumbase(ean: str) -> dict:
     """
     logger.info(f"[SeleniumBase] running for EAN: {ean}")
     
-    # --- START POPRAWKI PROXY ---
     proxy_string = None
     if PROXY_URL:
         if PROXY_USERNAME and PROXY_PASSWORD:
-            # format: user:pass@host:port
-            # seleniumbase oczekuje hosta bez http://
             proxy_host = PROXY_URL.replace("http://", "").replace("https://", "")
             proxy_string = f"{PROXY_USERNAME}:{PROXY_PASSWORD}@{proxy_host}"
         else:
-            proxy_string = PROXY_URL # zaklada format host:port
+            proxy_string = PROXY_URL 
         
-        logger.info(f"[SeleniumBase] using proxy: {proxy_string.split('@')[-1]}") # loguj tylko hosta
-    # --- KONIEC POPRAWKI PROXY ---
-
+        logger.info(f"[SeleniumBase] using proxy: {proxy_string.split('@')[-1]}") 
+    
     driver = None
     try:
-        # ZMIANA: Przekazanie proxy do Drivera
-        driver = Driver(headless2=True, proxy=proxy_string) 
+    # --- POPRAWKA 1 (nowa): Używamy 'headless2' i ustawiamy timeout PO inicjalizacji ---
+        # --- POPRAWKA 2: Włączamy wirtualny pulpit (XVFB) i VNC ---
+        driver = Driver(xvfb=True, proxy=proxy_string) 
+        driver.set_page_load_timeout(60)
         driver.maximize_window()
         driver.get(f'https://allegro.pl/listing?string={ean}')
-
-        # 1. get data from listing page
-        serialized_payload = WebDriverWait(driver, 30).until(
-            lambda d: _extract_listing_payload(d)
+        
+        # --- POPRAWKA 2: Dynamiczne szukanie selektora ---
+        # Czekamy na załadowanie DOWOLNEGO tagu z atrybutem 'data-serialize-box-id'
+        script_tags = WebDriverWait(driver, 20).until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, 'script[data-serialize-box-id]')
+            )
         )
-        if not serialized_payload:
-            raise TimeoutException("Listing payload not found")
+        
+        strData = None
+        # Przechodzimy przez wszystkie znalezione tagi
+        for tag in script_tags:
+            content = tag.get_attribute("innerHTML")
+            # Sprawdzamy, czy w tagu są dane, których szukamy
+            if '"__listing_StoreState"' in content:
+                strData = content
+                break # Mamy go, przerywamy pętlę
 
-        data = json.loads(serialized_payload)
+        if strData is None:
+            # Jeśli przeszliśmy pętlę i nie znaleźliśmy, to znaczy, że Allegro znowu coś zmieniło
+            logger.error(f"[SeleniumBase] Nie znaleziono tagu '__listing_StoreState' w żadnym skrypcie dla EAN {ean}")
+            raise TimeoutException("Nie znaleziono tagu skryptu z '__listing_StoreState' (selektor się zdezaktualizował)")
+        # --- KONIEC POPRAWKI 2 ---
+        
+        data = json.loads(strData)
 
         sold = None
         price = None
