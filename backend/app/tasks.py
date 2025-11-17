@@ -207,6 +207,37 @@ def _extract_listing_payload(driver):
     return None
 
 
+# Plik: backend/app/tasks.py
+# Upewnij się, że masz te importy na górze pliku:
+import logging
+import json
+import time
+import os # <-- WAŻNE
+from datetime import datetime, timezone
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from seleniumbase import Driver
+from app.db.session import SessionLocal
+from app.models.product import Product
+from app.models.import_log import ImportLog, ImportLogStatus
+from app.config import settings
+# ... (reszta twoich importów z tasks.py)
+
+
+# ... (celery_app = ...)
+
+logger = logging.getLogger(__name__)
+
+# --- UPEWNIJ SIĘ, ŻE ZMIENNE PROXY SĄ WCZYTANE ---
+PROXY_URL = settings.PROXY_URL
+PROXY_USERNAME = settings.PROXY_USERNAME
+PROXY_PASSWORD = settings.PROXY_PASSWORD
+
+
+# --- PODMIEŃ CAŁĄ FUNKCJĘ PONIŻEJ ---
+
 def fetch_with_seleniumbase(ean: str) -> dict:
     """
     scrapes allegro using seleniumbase for a single EAN
@@ -226,36 +257,49 @@ def fetch_with_seleniumbase(ean: str) -> dict:
     
     driver = None
     try:
-    # --- POPRAWKA 1 (nowa): Używamy 'headless2' i ustawiamy timeout PO inicjalizacji ---
-        # --- POPRAWKA 2: Włączamy wirtualny pulpit (XVFB) i VNC ---
-        driver = Driver(xvfb=True, proxy=proxy_string) 
-        driver.set_page_load_timeout(60)
+        # --- POPRAWKA: Wracamy do headless2 i set_page_load_timeout ---
+        driver = Driver(headless2=True, proxy=proxy_string) 
+        driver.set_page_load_timeout(60) 
         driver.maximize_window()
-        driver.get(f'https://allegro.pl/listing?string={ean}')
         
-        # --- POPRAWKA 2: Dynamiczne szukanie selektora ---
-        # Czekamy na załadowanie DOWOLNEGO tagu z atrybutem 'data-serialize-box-id'
+        logger.info(f"[SeleniumBase] Próbuję otworzyć stronę dla EAN: {ean}")
+        driver.get(f'https://allegro.pl/listing?string={ean}')
+        logger.info(f"[SeleniumBase] Strona załadowana dla EAN: {ean}")
+
+        # --- START DEBUGGING (ZAPISZ ZRZUT EKRANU) ---
+        try:
+            # Ta ścieżka /app/data/debug/ odnosi się do backend/data/debug/ na twoim komputerze
+            debug_dir = "/app/data/debug" 
+            os.makedirs(debug_dir, exist_ok=True) # Stwórz folder, jeśli nie istnieje
+            debug_path = os.path.join(debug_dir, f"debug_ean_{ean}.png")
+            driver.save_screenshot(debug_path)
+            logger.info(f"[SeleniumBase] ZAPISANO ZRZUT EKRANU do: {debug_path}")
+        except Exception as e:
+            logger.error(f"[SeleniumBase] Nie udało się zapisać zrzutu ekranu: {e}")
+        # --- KONIEC DEBUGGINGU ---
+        
+        # 1. get data from listing page
+        logger.info(f"[SeleniumBase] Czekam na tag skryptu dla EAN: {ean}...")
         script_tags = WebDriverWait(driver, 20).until(
             EC.presence_of_all_elements_located(
                 (By.CSS_SELECTOR, 'script[data-serialize-box-id]')
             )
         )
+        logger.info(f"[SeleniumBase] Znalazłem tagi skryptu dla EAN: {ean}")
+
         
         strData = None
-        # Przechodzimy przez wszystkie znalezione tagi
         for tag in script_tags:
             content = tag.get_attribute("innerHTML")
-            # Sprawdzamy, czy w tagu są dane, których szukamy
             if '"__listing_StoreState"' in content:
                 strData = content
-                break # Mamy go, przerywamy pętlę
+                break 
 
         if strData is None:
-            # Jeśli przeszliśmy pętlę i nie znaleźliśmy, to znaczy, że Allegro znowu coś zmieniło
-            logger.error(f"[SeleniumBase] Nie znaleziono tagu '__listing_StoreState' w żadnym skrypcie dla EAN {ean}")
+            logger.error(f"[SeleniumBase] Nie znaleziono '__listing_StoreState' w żadnym skrypcie dla EAN {ean}")
             raise TimeoutException("Nie znaleziono tagu skryptu z '__listing_StoreState' (selektor się zdezaktualizował)")
-        # --- KONIEC POPRAWKI 2 ---
-        
+
+        logger.info(f"[SeleniumBase] Wyodrębniono dane JSON dla EAN: {ean}")
         data = json.loads(strData)
 
         sold = None
@@ -265,50 +309,45 @@ def fetch_with_seleniumbase(ean: str) -> dict:
         # iterate through products on listing page
         for item in data["__listing_StoreState"]["items"]["elements"]:
             try:
-                # '10 osob kupilo' -> 10
                 sold_str = item['productPopularity']['label'].split(' ')[0]
                 sold = int(sold_str)
             except Exception:
-                pass # keep previous value if any
+                pass 
 
             try:
                 price_str = item['price']['mainPrice']['amount']
                 price = float(price_str)
             except Exception:
-                pass # keep previous value if any
+                pass 
 
-            # find the minimum price from all listings
             if price is not None:
                 if minPrice is None or price < minPrice:
                     minPrice = price
 
         # 2. validation step: go to product page and check EAN
-        pein = None # ean from product page
+        pein = None 
         try:
-            # click the first product title to go to product page
             title = driver.find_element(By.CSS_SELECTOR, '.mgn2_14.m9qz_yp')
             title.click()
-            time.sleep(2) # wait for potential redirects
+            time.sleep(2) 
             
-            # find the EAN meta tag on the product page
             script_tag = WebDriverWait(driver, 20).until(
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, 'meta[itemprop="gtin"]')
                 )
             )
             pein = script_tag.get_attribute("content")
+            logger.info(f"[SeleniumBase] Walidacja EAN na stronie produktu: {pein}")
         except Exception as e:
-            logger.warning(f"[SeleniumBase] EAN validation step failed for {ean}: {e}")
-            pass # could not validate ean
+            logger.warning(f"[SeleniumBase] Krok walidacji EAN nie powiódł się dla {ean}: {e}")
+            pass 
 
         # 3. final check
         notFound = False
         if (minPrice is None and sold is None):
-            # if we found no price and no sold count  assume not found
             notFound = True
         elif pein is not None and pein != ean:
-            # validation failed - the product found is not the one we searched for
-            logger.warning(f"[SeleniumBase] EAN mismatch! Searched for {ean}, but found {pein}")
+            logger.warning(f"[SeleniumBase] Niezgodność EAN! Szukano {ean}, znaleziono {pein}")
             notFound = True
 
         if notFound:
@@ -323,18 +362,21 @@ def fetch_with_seleniumbase(ean: str) -> dict:
             "source": "seleniumbase_scrape",
             "not_found": notFound
         }
-        logger.info(f"[SeleniumBase] result for EAN {ean}: {detail}")
+        logger.info(f"[SeleniumBase] REZULTAT dla EAN {ean}: {detail}")
         return detail
 
     except TimeoutException:
-        logger.error(f"[SeleniumBase] Timeout waiting for Allegro page for EAN {ean}")
-        return {"ean": ean, "source": "selenium_timeout", "not_found": True, "error": "TimeoutException", "last_checked_at": datetime.now(timezone.utc).isoformat()}
+        logger.error(f"[SeleniumBase] Timeout (20s) czekając na tag skryptu dla EAN {ean}")
+        return {"ean": ean, "source": "selenium_timeout_selector", "not_found": True, "error": "TimeoutException (Selector)", "last_checked_at": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
-        logger.error(f"[SeleniumBase] Critical subprocess error for EAN {ean}: {e}")
-        return {"ean": ean, "source": "selenium_error", "not_found": True, "error": str(e), "last_checked_at": datetime.now(timezone.utc).isoformat()}
+        logger.error(f"[SeleniumBase] Krytyczny błąd podprocesu dla EAN {ean}: {e}")
+        return {"ean": ean, "source": "selenium_error_critical", "not_found": True, "error": str(e), "last_checked_at": datetime.now(timezone.utc).isoformat()}
     finally:
         if driver:
-            driver.quit() # always close the browser
+            logger.info(f"[SeleniumBase] Zamykam przeglądarkę dla EAN: {ean}")
+            driver.quit()
+
+# ... (reszta pliku tasks.py)
 # --- KONIEC: NOWA funkcja scrapujaca ---
 
 
