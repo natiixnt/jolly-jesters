@@ -218,7 +218,7 @@ def fetch_with_seleniumbase(ean: str) -> dict:
     driver = None
     try:
         # ZMIANA: Przekazanie proxy do Drivera
-        driver = Driver(uc=True, headless=True, proxy=proxy_string) 
+        driver = Driver(headless=True, proxy=proxy_string) 
         driver.maximize_window()
         driver.get(f'https://allegro.pl/listing?string={ean}')
         

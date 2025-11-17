@@ -1,5 +1,5 @@
 # uzywamy pelnego obrazu debian  aby moc zainstalowac chrome
-FROM python:3.11-slim-bookworm
+FROM python:3.11-bookworm
 
 WORKDIR /app
 
