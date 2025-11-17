@@ -194,6 +194,19 @@ def find_columns_by_content(df, start_row):
 # --- POCZATEK: NOWA funkcja scrapujaca (SeleniumBase) ---
 logger = logging.getLogger(__name__) # get logger
 
+def _extract_listing_payload(driver):
+    """Return serialized listing JSON stored in Allegro script tags."""
+    scripts = driver.find_elements(By.CSS_SELECTOR, 'script[data-serialize-box-id]')
+    for script in scripts:
+        try:
+            inner_html = script.get_attribute("innerHTML")
+        except Exception:
+            continue
+        if inner_html and "__listing_StoreState" in inner_html:
+            return inner_html
+    return None
+
+
 def fetch_with_seleniumbase(ean: str) -> dict:
     """
     scrapes allegro using seleniumbase for a single EAN
@@ -221,15 +234,15 @@ def fetch_with_seleniumbase(ean: str) -> dict:
         driver = Driver(headless2=True, proxy=proxy_string) 
         driver.maximize_window()
         driver.get(f'https://allegro.pl/listing?string={ean}')
-        
+
         # 1. get data from listing page
-        script_tag = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, 'script[data-serialize-box-id="EHg7vYMJTQ275owpOcr4Lg=="]')
-            )
+        serialized_payload = WebDriverWait(driver, 30).until(
+            lambda d: _extract_listing_payload(d)
         )
-        strData = script_tag.get_attribute("innerHTML")
-        data = json.loads(strData)
+        if not serialized_payload:
+            raise TimeoutException("Listing payload not found")
+
+        data = json.loads(serialized_payload)
 
         sold = None
         price = None
