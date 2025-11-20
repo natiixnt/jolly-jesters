@@ -10,6 +10,7 @@ import logging
 from datetime import timezone
 import time
 import json
+import redis
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -30,6 +31,7 @@ from .config import CACHE_TTL_DAYS
 
 # --- Konfiguracja Celery (bez zmian) ---
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", CELERY_BROKER)
 celery = Celery("app.tasks", broker=CELERY_BROKER)
 
 celery.conf.task_default_queue = "celery"
@@ -52,6 +54,18 @@ celery.conf.worker_prefetch_multiplier = 1
 def init_db_connection(**kwargs):
     logger.info("Initializing DB connection for worker process...")
     engine.dispose(close=True)
+
+def _get_cache_ttl_days() -> int:
+    """Odczyt TTL cache z Redis (klucz scraper:cache_ttl_days) z fallbackiem do env."""
+    try:
+        r = redis.Redis.from_url(REDIS_URL)
+        raw = r.get("scraper:cache_ttl_days")
+        if raw:
+            val = int(raw)
+            return max(1, min(365, val))
+    except Exception:
+        pass
+    return CACHE_TTL_DAYS
 
 def with_db_session(func):
     """Decorator to provide a db session to a task."""
@@ -370,6 +384,20 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             errors='coerce'
         )
 
+        cache_ttl_days = _get_cache_ttl_days()
+        # Prefetch cache dla EAN?w z pliku, aby nie kolejkowa? ?wie?ych danych
+        eans_in_file = set(df["ean_norm"].dropna().astype(str).str.strip())
+        cache_rows = []
+        if eans_in_file:
+            cache_rows = (
+                db.query(models.AllegroCache)
+                .filter(models.AllegroCache.ean.in_(eans_in_file))
+                .all()
+            )
+        cache_map = {c.ean: c for c in cache_rows}
+        ttl_limit = datetime.utcnow() - timedelta(days=cache_ttl_days)
+        INVALID_CACHE_SOURCES = ['failed', 'error', 'ban_detected', 'captcha_detected', 'antibot_error', 'selenium_error', 'selenium_timeout']
+
         products_to_enqueue = []
         for _, row in df.iterrows():
             if not row["ean_norm"] or pd.isna(row["price_norm"]) or row["price_norm"] <= 0:
@@ -384,10 +412,26 @@ def parse_import_file(self, import_job_id: int, filepath: str):
                 status="pending",
             )
             db.add(p)
-            products_to_enqueue.append(p)
 
-        if not products_to_enqueue:
-            raise ValueError("Nie znaleziono poprawnych wierszy w pliku (sprawdź, czy EAN i Ceny są wypełnione).")
+            cache = cache_map.get(p.ean)
+            cache_fresh = (
+                cache
+                and cache.fetched_at
+                and cache.fetched_at > ttl_limit
+                and cache.source not in INVALID_CACHE_SOURCES
+            )
+            if cache_fresh:
+                if cache.not_found:
+                    p.status = "not_found"
+                    p.notes = f"Cached not_found @ {cache.fetched_at.date()}"
+                else:
+                    p.status = "done"
+                    p.notes = f"Cached data @ {cache.fetched_at.date()}"
+            else:
+                products_to_enqueue.append(p)
+
+        if not products_to_enqueue and not cache_rows:
+            raise ValueError("Nie znaleziono poprawnych wierszy w pliku (sprawd?, czy EAN i Ceny s? wype?nione).")
 
         db.flush()
 
@@ -407,6 +451,7 @@ def parse_import_file(self, import_job_id: int, filepath: str):
             db.commit()
             raise
 
+        finalize_job_if_complete(import_job_id)
     except (ValueError, Exception) as e:
         db.rollback()
         job_to_update = db.query(models.ImportJob).filter(models.ImportJob.id == import_job_id).first()
@@ -440,9 +485,10 @@ def fetch_allegro_data(self, product_input_id: int, ean: str):
                 return 
             # --- END FIX ---
 
+            cache_ttl_days = _get_cache_ttl_days()
             import_job_id = p.import_job_id
             cache = db.query(models.AllegroCache).filter(models.AllegroCache.ean == ean).first()
-            ttl_limit = datetime.utcnow() - timedelta(days=CACHE_TTL_DAYS)
+            ttl_limit = datetime.utcnow() - timedelta(days=cache_ttl_days)
 
             if cache and cache.fetched_at > ttl_limit:
                 

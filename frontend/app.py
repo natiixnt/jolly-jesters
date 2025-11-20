@@ -9,6 +9,7 @@ from io import BytesIO
 
 API_BASE = "http://pilot_backend:8000/api" 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "30"))
 
 def _get_redis():
     return redis.Redis.from_url(REDIS_URL)
@@ -29,19 +30,40 @@ with st.sidebar:
         if current:
             desired_default = max(1, min(20, int(current)))
     except Exception as e:
-        st.warning(f"Redis niedost?pny: {e}")
+        st.warning(f"Redis niedostepny: {e}")
 
-    desired = st.slider("Ile okien scrapera uruchomi??", 1, 20, desired_default)
-    if st.button("Zapisz liczb? okien"):
+    desired = st.slider("Ile okien scrapera ma sie uruchomic?", 1, 20, desired_default)
+    if st.button("Zapisz liczbe okien"):
         if redis_client:
             try:
                 redis_client.set("scraper:desired_instances", desired)
                 st.success(f"Ustawiono {desired} okien scrapera.")
             except Exception as e:
-                st.error(f"Nie uda?o si? zapisa? do Redis: {e}")
+                st.error(f"Nie udalo sie zapisac do Redis: {e}")
         else:
-            st.error("Brak po??czenia z Redis.")
+            st.error("Brak polaczenia z Redis.")
 
+    ttl_default = CACHE_TTL_DAYS
+    if redis_client:
+        try:
+            ttl_val_current = redis_client.get("scraper:cache_ttl_days")
+            if ttl_val_current:
+                ttl_default = max(1, min(365, int(ttl_val_current)))
+        except Exception:
+            pass
+    st.caption(f"Cache Allegro wazny {ttl_default} dni (starsze dane sa scrapowane ponownie).")
+
+    st.subheader("TTL cache (dni)")
+    ttl_val = st.slider("Ustaw waznosc cache (dni)", 1, 365, ttl_default)
+    if st.button("Zapisz TTL cache"):
+        if redis_client:
+            try:
+                redis_client.set("scraper:cache_ttl_days", ttl_val)
+                st.success(f"Cache TTL ustawiono na {ttl_val} dni.")
+            except Exception as e:
+                st.error(f"Nie udalo sie zapisac TTL do Redis: {e}")
+        else:
+            st.error("Brak polaczenia z Redis.")
 
 # ----------------------
 # Upload pliku
