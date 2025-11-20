@@ -25,8 +25,8 @@ from .database import SessionLocal, engine
 
 from . import models
 from .services.alerts import send_scraper_alert
-# --- ZMIANA: Importujemy tez zmienne proxy ---
-from .config import CACHE_TTL_DAYS, PROXY_URL, PROXY_USERNAME, PROXY_PASSWORD
+# --- Konfiguracja cache'u ---
+from .config import CACHE_TTL_DAYS
 
 # --- Konfiguracja Celery (bez zmian) ---
 CELERY_BROKER = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
@@ -196,34 +196,28 @@ logger = logging.getLogger(__name__) # get logger
 
 def fetch_with_seleniumbase(ean: str) -> dict:
     """
-    scrapes allegro using seleniumbase for a single EAN
-    based on the script provided by the user
+    Scrapes Allegro for a single EAN (parsed from the uploaded input file)
+    using the SeleniumBase snippet provided by the user.
     """
     logger.info(f"[SeleniumBase] running for EAN: {ean}")
-    
-    # --- START POPRAWKI PROXY ---
-    proxy_string = None
-    if PROXY_URL:
-        if PROXY_USERNAME and PROXY_PASSWORD:
-            # format: user:pass@host:port
-            # seleniumbase oczekuje hosta bez http://
-            proxy_host = PROXY_URL.replace("http://", "").replace("https://", "")
-            proxy_string = f"{PROXY_USERNAME}:{PROXY_PASSWORD}@{proxy_host}"
-        else:
-            proxy_string = PROXY_URL # zaklada format host:port
-        
-        logger.info(f"[SeleniumBase] using proxy: {proxy_string.split('@')[-1]}") # loguj tylko hosta
-    # --- KONIEC POPRAWKI PROXY ---
 
     driver = None
     try:
-        # ZMIANA: Przekazanie proxy do Drivera
-        driver = Driver(headless2=True, proxy=proxy_string) 
+        # Wymuszamy tryb headed jak w oryginalnym skrypcie (okno widoczne)
+        driver = Driver(uc=True, headed=True)
         driver.maximize_window()
         driver.get(f'https://allegro.pl/listing?string={ean}')
-        
-        # 1. get data from listing page
-        script_tag = WebDriverWait(driver, 20).until(
+
+        # Baner RODO potrafi blokować dopóki nie klikniemy zgody
+        try:
+            consent_btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-role="accept-consent"]'))
+            )
+            consent_btn.click()
+        except Exception:
+            pass
+
+        script_tag = WebDriverWait(driver, 40).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, 'script[data-serialize-box-id="EHg7vYMJTQ275owpOcr4Lg=="]')
             )
@@ -235,36 +229,40 @@ def fetch_with_seleniumbase(ean: str) -> dict:
         price = None
         minPrice = None
 
-        # iterate through products on listing page
         for item in data["__listing_StoreState"]["items"]["elements"]:
             try:
-                # '10 osob kupilo' -> 10
-                sold_str = item['productPopularity']['label'].split(' ')[0]
-                sold = int(sold_str)
+                sold_value = item['productPopularity']['label'].split(' ')[0]
+                sold = int(sold_value)
             except Exception:
-                pass # keep previous value if any
+                pass
 
             try:
-                price_str = item['price']['mainPrice']['amount']
-                price = float(price_str)
+                price_value = item['price']['mainPrice']['amount']
+                price = float(price_value)
             except Exception:
-                pass # keep previous value if any
+                pass
 
-            # find the minimum price from all listings
-            if price is not None:
-                if minPrice is None or price < minPrice:
-                    minPrice = price
+            if minPrice is None or (price is not None and price < minPrice):
+                minPrice = price
 
-        # 2. validation step: go to product page and check EAN
-        pein = None # ean from product page
+        pein = None
         try:
-            # click the first product title to go to product page
             title = driver.find_element(By.CSS_SELECTOR, '.mgn2_14.m9qz_yp')
-            title.click()
-            time.sleep(2) # wait for potential redirects
-            
-            # find the EAN meta tag on the product page
-            script_tag = WebDriverWait(driver, 20).until(
+            try:
+                title.click()
+            except Exception:
+                pass
+
+            time.sleep(2)
+
+            try:
+                href = driver.find_element(By.CLASS_NAME, '_1e32a_zIS-q').get_attribute('href')
+                if href:
+                    driver.get(href)
+            except Exception:
+                pass
+
+            script_tag = WebDriverWait(driver, 40).until(
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, 'meta[itemprop="gtin"]')
                 )
@@ -272,15 +270,11 @@ def fetch_with_seleniumbase(ean: str) -> dict:
             pein = script_tag.get_attribute("content")
         except Exception as e:
             logger.warning(f"[SeleniumBase] EAN validation step failed for {ean}: {e}")
-            pass # could not validate ean
 
-        # 3. final check
         notFound = False
         if (minPrice is None and sold is None):
-            # if we found no price and no sold count  assume not found
             notFound = True
         elif pein is not None and pein != ean:
-            # validation failed - the product found is not the one we searched for
             logger.warning(f"[SeleniumBase] EAN mismatch! Searched for {ean}, but found {pein}")
             notFound = True
 
@@ -293,7 +287,7 @@ def fetch_with_seleniumbase(ean: str) -> dict:
             "allegro_lowest_price": minPrice,
             "sold_count": sold,
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
-            "source": "seleniumbase_scrape",
+            "source": "scrape",
             "not_found": notFound
         }
         logger.info(f"[SeleniumBase] result for EAN {ean}: {detail}")
@@ -307,7 +301,7 @@ def fetch_with_seleniumbase(ean: str) -> dict:
         return {"ean": ean, "source": "selenium_error", "not_found": True, "error": str(e), "last_checked_at": datetime.now(timezone.utc).isoformat()}
     finally:
         if driver:
-            driver.quit() # always close the browser
+            driver.quit()
 # --- KONIEC: NOWA funkcja scrapujaca ---
 
 

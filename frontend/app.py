@@ -3,12 +3,45 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
+import os
+import redis
 from io import BytesIO
 
 API_BASE = "http://pilot_backend:8000/api" 
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+def _get_redis():
+    return redis.Redis.from_url(REDIS_URL)
 
 st.set_page_config(page_title="Import Allegro", layout="wide")
 st.title("Pilot: Import i analiza produktów")
+
+# ----------------------
+# Sterowanie liczb? okien scrapera
+# ----------------------
+with st.sidebar:
+    st.header("Scraper: liczba okien")
+    desired_default = 1
+    redis_client = None
+    try:
+        redis_client = _get_redis()
+        current = redis_client.get("scraper:desired_instances")
+        if current:
+            desired_default = max(1, min(20, int(current)))
+    except Exception as e:
+        st.warning(f"Redis niedost?pny: {e}")
+
+    desired = st.slider("Ile okien scrapera uruchomi??", 1, 20, desired_default)
+    if st.button("Zapisz liczb? okien"):
+        if redis_client:
+            try:
+                redis_client.set("scraper:desired_instances", desired)
+                st.success(f"Ustawiono {desired} okien scrapera.")
+            except Exception as e:
+                st.error(f"Nie uda?o si? zapisa? do Redis: {e}")
+        else:
+            st.error("Brak po??czenia z Redis.")
+
 
 # ----------------------
 # Upload pliku

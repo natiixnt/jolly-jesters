@@ -10,6 +10,7 @@ services:
       POSTGRES_USER: pilot
       POSTGRES_PASSWORD: pilot
       POSTGRES_DB: pilotdb
+      SELENIUM_HEADED: "true"
     ports:
       - "5433:5432"
     volumes:
@@ -84,6 +85,8 @@ services:
     environment:
       - WORKSPACE=/workspace
       # reszta (CELERY_BROKER_URL, DATABASE_URL) jest juz w .env
+      
+
     dns:
       - 8.8.8.8
     depends_on:
